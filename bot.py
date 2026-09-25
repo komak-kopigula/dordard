@@ -87,12 +87,12 @@ twm = _create_twm()
 
 LEVERAGE      = 20
 ORDER_USDT    = 2.0
-MAX_POSITIONS = 2
+MAX_POSITIONS = 3
 
 # ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
 SL_BAN_SECONDS = 3 * 60 * 60          # 3 jam setelah SL asli
 CASCADE_BAN_SECONDS = 1 * 60 * 60      # 1 jam setelah CASCADE_AFTER_SL
-TIME_LIMIT_BAN_SECONDS = 1 * 60 * 60   # 1 jam setelah TIME_LIMIT
+TIME_LIMIT_BAN_SECONDS = 30 * 60        # 30 menit setelah TIME_LIMIT; lebih ringan dari SL
 SL_LIQUIDATE_LOSERS = True             # Saat SL: tutup posisi lain yang floating loss
 
 # ── PROFIT GUARD / ATH GIVEBACK PROTECTION ──────────────────────────────────
@@ -105,7 +105,7 @@ PROFIT_GUARD_GIVEBACK_PCT_MID = 0.35    # ATH 2.50–5.00U  -> toleransi givebac
 PROFIT_GUARD_GIVEBACK_PCT_HIGH = 0.30   # ATH 5.00–10.00U -> toleransi giveback 30%
 PROFIT_GUARD_GIVEBACK_PCT_MAX = 0.20    # ATH >=10U -> toleransi giveback 20%
 PROFIT_GUARD_GIVEBACK_MIN = 0.50        # Batas minimum giveback nominal; bukan lagi $1 tetap
-PROFIT_GUARD_BAN_SECONDS = 2 * 60 * 60  # 2 jam blok entry baru
+PROFIT_GUARD_BAN_SECONDS = 3 * 60 * 60  # 3 jam blok entry baru setelah guard trigger
 PROFIT_GUARD_CLOSE_LOSERS = True       # Saat guard aktif, close posisi lain yang floating loss
 
 # ── SIGNAL FLIP EXIT ────────────────────────────────────────────────────────
@@ -145,7 +145,12 @@ MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
 MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # 3 Jam batas maksimal tahan posisi
+MAX_HOLD_SECONDS  = 6120   # hard limit 102 menit (batas absolut)
+TIME_LIMIT_SOFT_SECONDS = 45 * 60
+TIME_LIMIT_PROFIT_SECONDS = 75 * 60
+TIME_LIMIT_LOSS_PNL = -0.12
+TIME_LIMIT_SMALL_PROFIT_PNL = 0.10
+PROFIT_GUARD_EMERGENCY_GAP = 0.25
 # ──────────────────────────────────────────────────────────────────────────
 
 # ── Institutional Microstructure (Order Book Depth) ───────────────────────
@@ -743,6 +748,8 @@ _profit_guard_until = 0.0
 _profit_guard_trigger = ""
 _profit_guard_triggered_ath = 0.0
 _profit_guard_in_progress = False
+_profit_guard_last_floor = 0.0
+_profit_guard_last_trigger_ts = 0.0
 _sl_cascade_close_count = 0
 
 def _log_err(tag, e, cooldown=10):
@@ -1160,18 +1167,8 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
     if SL_LIQUIDATE_LOSERS:
         _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
 
-def _maybe_activate_profit_guard():
-    global _profit_guard_triggered_ath, _profit_guard_in_progress
-
-    if not PROFIT_GUARD_ENABLED:
-        return
-
-    pnl = _stats["pnl"]
+def _profit_guard_metrics():
     ath = _stats["ath_pnl"]
-    if ath < PROFIT_GUARD_ARM_PNL:
-        return
-    # Dynamic giveback berdasarkan besarnya ATH. Guard tidak berhenti di +1.50U;
-    # setelah ATH naik, floor ikut naik dan toleransi giveback makin ketat.
     if ath < 2.50:
         giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_LOW
     elif ath < 5.00:
@@ -1180,21 +1177,40 @@ def _maybe_activate_profit_guard():
         giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_HIGH
     else:
         giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MAX
-
     giveback = max(PROFIT_GUARD_GIVEBACK_MIN, ath * giveback_pct)
-    floor = ath - giveback
-    if pnl > floor:
+    return ath, ath - giveback, giveback_pct
+
+def _maybe_activate_profit_guard():
+    global _profit_guard_triggered_ath, _profit_guard_in_progress
+    global _profit_guard_last_floor, _profit_guard_last_trigger_ts
+
+    if not PROFIT_GUARD_ENABLED:
         return
-    if ath <= _profit_guard_triggered_ath + 1e-9:
-        return
-    if _profit_guard_in_progress:
+    pnl = _stats["pnl"]
+    ath = _stats["ath_pnl"]
+    if ath < PROFIT_GUARD_ARM_PNL:
         return
 
-    _profit_guard_triggered_ath = ath
+    _, floor, giveback_pct = _profit_guard_metrics()
+    _profit_guard_last_floor = floor
+
+    trigger_new_ath = pnl <= floor and ath > _profit_guard_triggered_ath + 1e-9
+    trigger_emergency = (
+        _profit_guard_triggered_ath > 0
+        and pnl <= floor - PROFIT_GUARD_EMERGENCY_GAP
+        and time.time() - _profit_guard_last_trigger_ts >= 300
+    )
+    if not (trigger_new_ath or trigger_emergency) or _profit_guard_in_progress:
+        return
+
+    if trigger_new_ath:
+        _profit_guard_triggered_ath = ath
     _profit_guard_in_progress = True
+    _profit_guard_last_trigger_ts = time.time()
     try:
         _activate_aux_ban("PROFIT_GUARD", PROFIT_GUARD_BAN_SECONDS, "ATH_GIVEBACK")
-        print(f"  🧱 [PROFIT GUARD] PnL {pnl:+.4f}U turun dari ATH {ath:+.4f}U melewati floor {floor:+.4f}U | giveback:{ath-pnl:+.4f}U")
+        mode = "EMERGENCY" if trigger_emergency else "TRIGGER"
+        print(f"  🧱 [PROFIT GUARD {mode}] PnL {pnl:+.4f}U | ATH {ath:+.4f}U | floor {floor:+.4f}U | giveback:{ath-pnl:+.4f}U ({giveback_pct:.0%})")
         if PROFIT_GUARD_CLOSE_LOSERS:
             _liquidate_losing_positions("PROFIT_GUARD")
     finally:
@@ -1326,7 +1342,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
                     "sl_pct": new_risk["sl_pct"],
                     "tp_price": new_risk["tp_price"],
                     "sl_price": new_risk["sl_price"],
-                    "peak_price": price
+                    "peak_price": price,
+                    "peak_floating_pnl": 0.0
                 })
 
         print(f"         ✅ ORDER #{order.get('orderId')} | {execution_side} | fill:{price:.6g} | qty:{filled_qty:.8g}")
@@ -1494,11 +1511,6 @@ def monitor_positions():
         if pos is None or pos.get("_r"): continue
 
         hold_time = time.time() - pos["open_time"]
-        if hold_time > MAX_HOLD_SECONDS:
-            print(f"  ⏰ {sym}: MAX_HOLD_SECONDS terlampaui ({hold_time:.0f}s) — TIME_LIMIT close + ban 1 jam")
-            live_close(sym, "TIME_LIMIT")
-            continue
-
         px = price_live(sym)
         if px == 0:
             pos["_fail_count"] = pos.get("_fail_count", 0) + 1
@@ -1507,6 +1519,25 @@ def monitor_positions():
                 print(f"  ⚠️ {sym}: price_live gagal {fc}x — SL/TP monitoring tertunda")
             continue
         pos["_fail_count"] = 0
+
+        floating_pnl = _estimate_floating_pnl(pos, px)
+        peak_fpnl = max(pos.get("peak_floating_pnl", floating_pnl), floating_pnl)
+        pos["peak_floating_pnl"] = peak_fpnl
+
+        if hold_time >= TIME_LIMIT_SOFT_SECONDS and floating_pnl <= TIME_LIMIT_LOSS_PNL:
+            print(f"  ⏰ {sym}: TIME_LIMIT EARLY-LOSS | hold:{hold_time:.0f}s floating:{floating_pnl:+.4f}U peak:{peak_fpnl:+.4f}U")
+            live_close(sym, "TIME_LIMIT")
+            continue
+
+        if hold_time >= TIME_LIMIT_PROFIT_SECONDS and floating_pnl <= TIME_LIMIT_SMALL_PROFIT_PNL:
+            print(f"  ⏰ {sym}: TIME_LIMIT STAGNANT | hold:{hold_time:.0f}s floating:{floating_pnl:+.4f}U peak:{peak_fpnl:+.4f}U")
+            live_close(sym, "TIME_LIMIT")
+            continue
+
+        if hold_time > MAX_HOLD_SECONDS:
+            print(f"  ⏰ {sym}: HARD MAX_HOLD {MAX_HOLD_SECONDS}s | floating:{floating_pnl:+.4f}U — TIME_LIMIT")
+            live_close(sym, "TIME_LIMIT")
+            continue
 
         side, tp_px, sl_px = pos["side"], pos["tp_price"], pos["sl_price"]
 
@@ -1637,18 +1668,10 @@ def print_full():
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']}")
     circuit, _ = _circuit_snapshot()
     if _stats['ath_pnl'] >= PROFIT_GUARD_ARM_PNL:
-        ath = _stats['ath_pnl']
-        if ath < 2.50:
-            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_LOW
-        elif ath < 5.00:
-            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MID
-        elif ath < 10.00:
-            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_HIGH
-        else:
-            giveback_pct = PROFIT_GUARD_GIVEBACK_PCT_MAX
-        giveback = max(PROFIT_GUARD_GIVEBACK_MIN, ath * giveback_pct)
-        profit_floor = ath - giveback
-        guard_info = f" | Floor:{profit_floor:+.3f}U ({giveback_pct:.0%} GB)"
+        ath, profit_floor, giveback_pct = _profit_guard_metrics()
+        gap = _stats['pnl'] - profit_floor
+        guard_state = "TRIGGERED" if _stats['profit_guard_count'] > 0 and gap <= 0 else "ARMED"
+        guard_info = f" | {guard_state} | Floor:{profit_floor:+.3f}U ({giveback_pct:.0%} GB) | Gap:{gap:+.3f}U"
     else:
         guard_info = ""
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
@@ -1904,7 +1927,7 @@ def run_bot():
     print("║  2. TP = 2.5–3.5% (3.5x ATR capped)                              ║")
     print("║  3. SL = 1.5–2.5% (1.8x ATR capped)                              ║")
     print("║  4. SL = BAN 3 JAM + CLOSE POSISI LAIN YANG SEDANG LOSS          ║")
-    print("║  5. CASCADE/TIME_LIMIT = BAN 1 JAM | PROFIT GUARD aktif           ║")
+    print("║  5. CASCADE=1 JAM / TIME_LIMIT=30 MENIT | PROFIT GUARD aktif           ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     try:
         valid = {s["symbol"] for s in _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)["symbols"] if s["status"] == "TRADING"}
