@@ -41,63 +41,48 @@ from binance import ThreadedWebsocketManager
 import ta
 
 load_dotenv()
-
 api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
-# ============================================================
-# BINANCE FUTURES DEMO / PAPER TRADING
-# ============================================================
 try:
-    client = Client(
-        api_key,
-        api_secret,
-        demo=True
-    )
+    client = Client(api_key, api_secret, demo=True)
 except Exception:
-    client = Client(
-        api_key,
-        api_secret,
-        demo=True
-    )
-
-# REST Futures DEMO
+    client = Client(api_key, api_secret, demo=True)
 client.FUTURES_URL = "https://demo-fapi.binance.com/fapi"
 
-# WebSocket tuning
+# WebSocket tuning. python-binance versions that support max_queue_size get a
+# larger per-socket queue; older versions are handled without breaking startup.
 WS_MAX_QUEUE_SIZE = 2000
 DEPTH_SOCKET_CHUNK = 8
 MARK_PRICE_FAST = False
 
-
 def _create_twm():
-    kwargs = {
-        "api_key": api_key,
-        "api_secret": api_secret,
-    }
-
+    kwargs = {"api_key": api_key, "api_secret": api_secret}
     try:
-        params = inspect.signature(
-            ThreadedWebsocketManager.__init__
-        ).parameters
-
+        params = inspect.signature(ThreadedWebsocketManager.__init__).parameters
         if "max_queue_size" in params:
             kwargs["max_queue_size"] = WS_MAX_QUEUE_SIZE
-
     except Exception:
         pass
-
     try:
-        return ThreadedWebsocketManager(**kwargs)
-
+        twm = ThreadedWebsocketManager(**kwargs)
+        # python-binance 1.0.37: TWM constructor does not expose demo=,
+        # but its internal AsyncClient does. Force that internal client to Demo.
+        if hasattr(twm, "_client_params") and isinstance(twm._client_params, dict):
+            twm._client_params["demo"] = True
+        return twm
     except TypeError:
         kwargs.pop("max_queue_size", None)
-        return ThreadedWebsocketManager(**kwargs)
-
+        twm = ThreadedWebsocketManager(**kwargs)
+        if hasattr(twm, "_client_params") and isinstance(twm._client_params, dict):
+            twm._client_params["demo"] = True
+        return twm
     except Exception:
         kwargs.pop("max_queue_size", None)
-        return ThreadedWebsocketManager(**kwargs)
-
+        twm = ThreadedWebsocketManager(**kwargs)
+        if hasattr(twm, "_client_params") and isinstance(twm._client_params, dict):
+            twm._client_params["demo"] = True
+        return twm
 
 twm = _create_twm()
 
