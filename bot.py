@@ -74,7 +74,6 @@ def _create_twm():
     kwargs = {
         "api_key": api_key,
         "api_secret": api_secret,
-        "demo": True
     }
 
     try:
