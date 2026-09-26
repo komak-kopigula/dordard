@@ -61,14 +61,14 @@ except Exception:
         demo=True
     )
 
-# Paksa REST ke Binance Futures Demo
+# REST Futures DEMO
 client.FUTURES_URL = "https://demo-fapi.binance.com/fapi"
 
-# WebSocket tuning. python-binance versions that support max_queue_size get a
-# larger per-socket queue; older versions are handled without breaking startup.
+# WebSocket tuning
 WS_MAX_QUEUE_SIZE = 2000
 DEPTH_SOCKET_CHUNK = 8
 MARK_PRICE_FAST = False
+
 
 def _create_twm():
     kwargs = {
@@ -76,20 +76,29 @@ def _create_twm():
         "api_secret": api_secret,
         "demo": True
     }
+
     try:
-        params = inspect.signature(ThreadedWebsocketManager.__init__).parameters
+        params = inspect.signature(
+            ThreadedWebsocketManager.__init__
+        ).parameters
+
         if "max_queue_size" in params:
             kwargs["max_queue_size"] = WS_MAX_QUEUE_SIZE
+
     except Exception:
         pass
+
     try:
         return ThreadedWebsocketManager(**kwargs)
+
     except TypeError:
         kwargs.pop("max_queue_size", None)
         return ThreadedWebsocketManager(**kwargs)
+
     except Exception:
         kwargs.pop("max_queue_size", None)
         return ThreadedWebsocketManager(**kwargs)
+
 
 twm = _create_twm()
 
