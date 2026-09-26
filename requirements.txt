@@ -1,11 +1,8 @@
 flask
 gunicorn
 python-dotenv
-python-binance==1.0.37
-ta==0.11.0
+python-binance
+ta
 pandas
 requests
 numpy
-websocket-client>=1.8,<2
-tvdatafeed-enhanced==2.2.1
-websockets>=14.1,<15
