@@ -110,7 +110,7 @@ twm = _create_twm()
 #  CONFIGURATION & INSTITUTIONAL PARAMETERS
 # ═══════════════════════════════════════════════════════════════════════════
 
-LEVERAGE      = 20
+LEVERAGE      = 25
 ORDER_USDT    = 2.0
 MAX_POSITIONS = 2
 
@@ -913,7 +913,8 @@ def _get_symbol_rules(symbol):
 
 
 DEMO_MIN_NOTIONAL_USDT = 50.0
-DEMO_MIN_NOTIONAL_BUFFER = 1.02  # sedikit buffer agar rounding tidak memicu -4164
+DEMO_MAX_MARGIN_USDT = 2.10
+DEMO_MIN_NOTIONAL_BUFFER = 1.00
 
 
 def qty(symbol, price):
@@ -925,9 +926,10 @@ def qty(symbol, price):
     min_qty = rules["min_qty"]
     precision = rules["precision"]
 
-    # Existing sizing is preserved, but Binance Futures requires >= 50 USDT
-    # notional for this account/order type. Use a small safety buffer.
+    # Keep initial margin around ORDER_USDT while satisfying Binance minimum
+    # notional. With 25x leverage, 50 USDT notional = exactly 2 USDT margin.
     target_notional = max(ORDER_USDT * LEVERAGE, DEMO_MIN_NOTIONAL_USDT * DEMO_MIN_NOTIONAL_BUFFER)
+    max_notional = DEMO_MAX_MARGIN_USDT * LEVERAGE
     raw = target_notional / price
 
     # CEIL to the lot step so the final rounded quantity does not fall below
@@ -944,6 +946,12 @@ def qty(symbol, price):
     if step > 0:
         while q_val * price < DEMO_MIN_NOTIONAL_USDT * DEMO_MIN_NOTIONAL_BUFFER:
             q_val = round(q_val + step, precision)
+
+    # Never allow lot-step/minQty rounding to push initial margin above the
+    # requested 2.10 USDT ceiling. Such a symbol is skipped rather than
+    # silently opening a larger position.
+    if q_val * price > max_notional + 1e-9:
+        return 0.0
 
     return q_val
 
