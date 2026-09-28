@@ -25,7 +25,6 @@ MODE:
       * floating PnL <= 0 -> TIME_LIMIT
       * 90 menit total -> TIME_LIMIT
 - Profit Guard dynamic berbasis ATH PnL
-- Signal Flip Exit: 1 candle 5m closed berlawanan kuat
 """
 
 import sys
@@ -131,12 +130,6 @@ PROFIT_GUARD_GIVEBACK_PCT_MAX = 0.20
 PROFIT_GUARD_GIVEBACK_MIN = 0.50
 PROFIT_GUARD_BAN_SECONDS = 2 * 60 * 60
 PROFIT_GUARD_CLOSE_LOSERS = True
-
-# ── SIGNAL FLIP EXIT ────────────────────────────────────────────────────────
-SIGNAL_FLIP_EXIT_ENABLED = True
-SIGNAL_FLIP_MIN_SCORE = 65
-SIGNAL_FLIP_CONFIRM_CANDLES = 1
-SIGNAL_FLIP_MIN_HOLD_SECONDS = 90
 
 # ── HARD 30-MINUTE TIME LIMIT ──────────────────────────────────────────────
 # Semua posisi wajib ditutup maksimal pada menit ke-30.
@@ -765,7 +758,7 @@ _stats = {
     "hist": deque(maxlen=200), "start": time.time(),
     "sl_ban_count": 0, "sl_cascade_closes": 0,
     "cascade_ban_count": 0, "time_limit_ban_count": 0,
-    "profit_guard_count": 0, "signal_flip_exits": 0,
+    "profit_guard_count": 0,
     "time_grace_entries": 0,
     "time_grace_exits": 0,
 }
@@ -919,22 +912,39 @@ def _get_symbol_rules(symbol):
     raise RuntimeError(f"Symbol {symbol} tidak ditemukan di DEMO exchangeInfo")
 
 
+DEMO_MIN_NOTIONAL_USDT = 50.0
+DEMO_MIN_NOTIONAL_BUFFER = 1.02  # sedikit buffer agar rounding tidak memicu -4164
+
+
 def qty(symbol, price):
-    """Calculate order quantity and round DOWN to Binance DEMO lot-size step."""
+    """Calculate a DEMO MARKET quantity that satisfies Binance min-notional and lot step."""
     if price <= 0:
         return 0.0
-    raw = (ORDER_USDT * LEVERAGE) / price
     rules = _get_symbol_rules(symbol)
     step = rules["step_size"]
     min_qty = rules["min_qty"]
     precision = rules["precision"]
 
+    # Existing sizing is preserved, but Binance Futures requires >= 50 USDT
+    # notional for this account/order type. Use a small safety buffer.
+    target_notional = max(ORDER_USDT * LEVERAGE, DEMO_MIN_NOTIONAL_USDT * DEMO_MIN_NOTIONAL_BUFFER)
+    raw = target_notional / price
+
+    # CEIL to the lot step so the final rounded quantity does not fall below
+    # the minimum notional after exchange rounding.
     if step > 0:
-        raw = math.floor((raw + 1e-15) / step) * step
+        raw = math.ceil((raw - 1e-15) / step) * step
 
     q_val = round(raw, precision)
     if min_qty > 0 and q_val < min_qty:
-        return 0.0
+        q_val = min_qty
+
+    # One final check in case precision/step rounding still leaves notional
+    # below the exchange minimum.
+    if step > 0:
+        while q_val * price < DEMO_MIN_NOTIONAL_USDT * DEMO_MIN_NOTIONAL_BUFFER:
+            q_val = round(q_val + step, precision)
+
     return q_val
 
 
@@ -1741,52 +1751,6 @@ def _check_time_limit_stage(sym, pos, px):
     return True
 
 
-def _check_signal_flip_exit(sym, pos):
-    if not SIGNAL_FLIP_EXIT_ENABLED:
-        return False
-    if time.time() - pos.get("open_time", time.time()) < SIGNAL_FLIP_MIN_HOLD_SECONDS:
-        return False
-
-    with _kline_lock:
-        df = _kline_cache.get(sym)
-    if df is None or len(df) < 55:
-        return False
-
-    try:
-        candle_key = int(df.iloc[-2]["time"])
-    except Exception:
-        return False
-
-    if candle_key == pos.get("_signal_checked_candle"):
-        return False
-    pos["_signal_checked_candle"] = candle_key
-
-    try:
-        df_ta = run_ta(df.copy())
-        signal, score, _, _, regime, _ = scorer.get_signal(df_ta, sym)
-    except Exception as e:
-        _log_err(f"signal_flip_{sym}", e, cooldown=30)
-        return False
-
-    side = pos.get("side")
-    opposite = "SHORT" if side == "LONG" else "LONG"
-
-    if signal == opposite and score >= SIGNAL_FLIP_MIN_SCORE:
-        last_dir = pos.get("_flip_candidate")
-        count = pos.get("_flip_count", 0) + 1 if last_dir == signal else 1
-        pos["_flip_candidate"] = signal
-        pos["_flip_count"] = count
-
-        print(f"  🔄 [SIGNAL FLIP] {sym} {side} -> {signal} | score:{score:.0f} | regime:{regime} | confirm:{count}/{SIGNAL_FLIP_CONFIRM_CANDLES}")
-        if count >= SIGNAL_FLIP_CONFIRM_CANDLES:
-            _stats["signal_flip_exits"] += 1
-            live_close(sym, "SIGNAL_FLIP")
-            return True
-    else:
-        pos["_flip_candidate"] = None
-        pos["_flip_count"] = 0
-    return False
-
 
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -1832,8 +1796,6 @@ def monitor_positions():
         if _check_time_limit_stage(sym, pos, px):
             continue
 
-        # Cut only on a strong closed 5m opposite signal.
-        _check_signal_flip_exit(sym, pos)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  6. SCANNER THREAD & HARD VETO FILTERS
@@ -1928,7 +1890,7 @@ def print_inline():
     e = "💚" if pnl >= 0 else "🔴"
     print(f"       ┌ [DEMO ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
     circuit, _ = _circuit_snapshot()
-    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | Circuit:{circuit or 'READY'} | Cascade:{_stats['sl_cascade_closes']} | FlipExit:{_stats['signal_flip_exits']} | Grace:{_stats['time_grace_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
+    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | Circuit:{circuit or 'READY'} | Cascade:{_stats['sl_cascade_closes']} | Grace:{_stats['time_grace_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
 
 def print_full():
@@ -1965,7 +1927,7 @@ def print_full():
         guard_info = ""
 
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
-    print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | FlipExit:{_stats['signal_flip_exits']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
+    print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
     print(f"    🕐 TIME ENGINE: HARD MAX 30m | Loss@30m -> BAN 1h | Profit@30m -> NO BAN")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
@@ -2276,7 +2238,7 @@ def run_bot():
     print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
     print("║  5. SL BAN 3 JAM + CLOSE POSISI LAIN YANG LOSS                  ║")
     print("║  6. TIME: HARD MAX 30m | LOSS->BAN 1h | PROFIT->NO BAN         ║")
-    print("║  7. Profit Guard + Signal Flip aktif                            ║")
+    print("║  7. Profit Guard aktif                                           ║")
     print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
@@ -2368,7 +2330,7 @@ def run_bot():
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}")
         elif slots == 0:
-            print("  ✅ Slots full — monitoring REAL DEMO positions + TP/SL + TIME ENGINE + SIGNAL FLIP")
+            print("  ✅ Slots full — monitoring REAL DEMO positions + TP/SL + TIME ENGINE")
         else:
             print(f"  🔍 {slots} slot kosong — scanning untuk REAL DEMO entry...")
 
