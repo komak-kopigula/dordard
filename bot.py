@@ -1,5 +1,5 @@
 """
-Bot Scalping v22.0 — BINANCE FUTURES DEMO EXECUTION — INSTITUTIONAL QUANT ENGINE
+Bot Scalping v22.0 — BINANCE FUTURES DEMO EXECUTION — INVERSE ENTRY / 30M MAX HOLD
 ================================================================================
 MODE:
 - Market data: LIVE Binance Futures public market data
@@ -138,12 +138,16 @@ SIGNAL_FLIP_MIN_SCORE = 65
 SIGNAL_FLIP_CONFIRM_CANDLES = 1
 SIGNAL_FLIP_MIN_HOLD_SECONDS = 90
 
-# ── TWO-STAGE TIME LIMIT ────────────────────────────────────────────────────
-TIME_LIMIT_STAGE1_SECONDS = 30 * 60      # 30 menit
-TIME_LIMIT_GRACE_SECONDS = 60 * 60        # tambahan 1 jam
-MAX_TOTAL_HOLD_SECONDS = TIME_LIMIT_STAGE1_SECONDS + TIME_LIMIT_GRACE_SECONDS
-TIME_LIMIT_GRACE_REQUIRE_PROFIT = True    # menit 30 harus floating profit
-TIME_LIMIT_GRACE_EXIT_ON_LOSS = True      # saat grace berubah <= 0, close
+# ── HARD 30-MINUTE TIME LIMIT ──────────────────────────────────────────────
+# Semua posisi wajib ditutup maksimal pada menit ke-30.
+# - Floating loss pada menit ke-30 -> TIME_LIMIT + BAN ENTRY 1 jam
+# - Floating profit pada menit ke-30 -> TIME_LIMIT, TANPA BAN
+# - TP / SL / exit lain sebelum 30m -> tidak menambah TIME_BAN
+TIME_LIMIT_STAGE1_SECONDS = 30 * 60
+TIME_LIMIT_GRACE_SECONDS = 0
+MAX_TOTAL_HOLD_SECONDS = TIME_LIMIT_STAGE1_SECONDS
+TIME_LIMIT_GRACE_REQUIRE_PROFIT = False
+TIME_LIMIT_GRACE_EXIT_ON_LOSS = False
 
 # ── Scanning & Concurrency ─────────────────────────────────────────────────
 SCAN_INTERVAL = 2.0
@@ -1473,6 +1477,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         raise RuntimeError("DEMO_TRADING must remain True")
     if orig_direction not in ("LONG", "SHORT"):
         return
+    # INVERSE ENTRY: signal LONG -> actual SHORT, signal SHORT -> actual LONG.
+    execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
     if _order_state_uncertain:
         print(f"  ⛔ [{sym}] ENTRY DIBLOKIR: ORDER_STATE_UNKNOWN")
         return
@@ -1500,19 +1506,19 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             )
 
         response, account_pos, fill_price, actual_qty = _demo_market_open(
-            sym, orig_direction, q_val
+            sym, execution_side, q_val
         )
 
         if fill_price <= 0:
             raise RuntimeError(f"Fill price DEMO tidak valid: {fill_price}")
 
         new_risk = DynamicRiskManager.calculate_levels(
-            fill_price, orig_direction, atr
+            fill_price, execution_side, atr
         )
         now = time.time()
 
         pos = {
-            "side": orig_direction,
+            "side": execution_side,
             "orig_signal": orig_direction,
             "entry": fill_price,
             "qty": actual_qty,
@@ -1540,7 +1546,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             live_positions[sym] = pos
 
         print(
-            f"\n  🚀 [DEMO REAL ENTRY] {sym} {orig_direction} @ {fill_price:.8g} "
+            f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} @ {fill_price:.8g} "
             f"| qty:{actual_qty:.8g} | leverage:{LEVERAGE}x "
             f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
         )
@@ -1553,7 +1559,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock:
             live_positions.pop(sym, None)
         _log_err(f"DEMO_ENTRY_{sym}", e, cooldown=2)
-        print(f"  ❌ [DEMO ENTRY GAGAL] {sym} {orig_direction}: {e}")
+        print(f"  ❌ [DEMO ENTRY GAGAL] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side}: {e}")
 
 
 def live_close(sym, reason, price=None):
@@ -1694,7 +1700,9 @@ def live_close(sym, reason, price=None):
         _activate_sl_ban_and_liquidate(sym)
     elif reason == "CASCADE_AFTER_SL":
         _activate_aux_ban("CASCADE", CASCADE_BAN_SECONDS, sym)
-    elif reason in ("TIME_LIMIT", "TIME_LIMIT_GRACE_DRAWDOWN"):
+    elif reason == "TIME_LIMIT" and pos.get("_time_limit_ban", False):
+        # Hanya TIME_LIMIT yang benar-benar LOSS pada menit ke-30
+        # yang mengaktifkan ban entry 1 jam. Profit-at-time-limit tidak ban.
         _activate_aux_ban("TIME_LIMIT", TIME_LIMIT_BAN_SECONDS, sym)
 
     _maybe_activate_profit_guard()
@@ -1707,57 +1715,30 @@ def live_close(sym, reason, price=None):
 
 
 
-def _activate_time_grace(sym, pos, floating_pnl):
-    now = time.time()
-    pos["time_stage"] = 2
-    pos["grace_start_pnl"] = floating_pnl
-    pos["grace_until"] = pos["open_time"] + MAX_TOTAL_HOLD_SECONDS
-    _stats["time_grace_entries"] += 1
-    if not pos.get("_time_grace_warned"):
-        pos["_time_grace_warned"] = True
-        remaining = max(0, pos["grace_until"] - now)
-        print(
-            f"  ⏳ [TIME GRACE] {sym} masih profit pada {TIME_LIMIT_STAGE1_SECONDS/60:.0f}m | Float:{floating_pnl:+.5f}U "
-            f"→ tambahan {TIME_LIMIT_GRACE_SECONDS/60:.0f}m | total max: {MAX_TOTAL_HOLD_SECONDS/60:.0f}m | grace_left:{remaining/60:.1f}m"
-        )
-
-
 def _check_time_limit_stage(sym, pos, px):
-    """Return True if position was closed by the time engine."""
+    """Hard 30-minute max hold. Loss at timeout gets 1h entry ban; profit does not."""
     hold_time = time.time() - pos["open_time"]
-    floating_pnl = _estimate_floating_pnl(pos, px)
-
-    # Stage 1: first 30 minutes.
-    if pos.get("time_stage", 1) == 1 and hold_time >= TIME_LIMIT_STAGE1_SECONDS:
-        if TIME_LIMIT_GRACE_REQUIRE_PROFIT and floating_pnl <= 0:
-            print(
-                f"  ⏰ {sym}: {TIME_LIMIT_STAGE1_SECONDS/60:.0f}m TIME_LIMIT | Float:{floating_pnl:+.5f}U <= 0 → close + TIME_BAN 1 jam"
-            )
-            live_close(sym, "TIME_LIMIT", px)
-            return True
-
-        _activate_time_grace(sym, pos, floating_pnl)
+    if hold_time < TIME_LIMIT_STAGE1_SECONDS:
         return False
 
-    # Stage 2: grace window (60 menit tambahan).
-    if pos.get("time_stage", 1) == 2:
-        if TIME_LIMIT_GRACE_EXIT_ON_LOSS and floating_pnl <= 0:
-            print(
-                f"  🛡️ {sym}: GRACE profit giveback → Float:{floating_pnl:+.5f}U <= 0 "
-                f"→ close TIME_LIMIT_GRACE_DRAWDOWN + ban 1 jam"
-            )
-            live_close(sym, "TIME_LIMIT_GRACE_DRAWDOWN", px)
-            return True
+    floating_pnl = _estimate_floating_pnl(pos, px)
+    # Mark the exact timeout state before live_close() records the trade.
+    # This prevents a profitable TIME_LIMIT close from receiving a TIME_BAN.
+    pos["_time_limit_ban"] = floating_pnl < 0
 
-        if hold_time >= MAX_TOTAL_HOLD_SECONDS:
-            print(
-                f"  ⏰ {sym}: total hold {hold_time/60:.1f}m >= {MAX_TOTAL_HOLD_SECONDS/60:.0f}m "
-                f"→ TIME_LIMIT | Float:{floating_pnl:+.5f}U"
-            )
-            live_close(sym, "TIME_LIMIT", px)
-            return True
+    if floating_pnl < 0:
+        print(
+            f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
+            f"Float:{floating_pnl:+.5f}U < 0 → close + TIME_BAN 1 jam"
+        )
+    else:
+        print(
+            f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
+            f"Float:{floating_pnl:+.5f}U >= 0 → close TANPA TIME_BAN"
+        )
 
-    return False
+    live_close(sym, "TIME_LIMIT", px)
+    return True
 
 
 def _check_signal_flip_exit(sym, pos):
@@ -1875,7 +1856,10 @@ def scan_one(sym):
             return None
         if orig_direction not in ("LONG", "SHORT"):
             return None
-        execution_side = orig_direction
+        # INVERSE ENTRY MODE: hasil analisa sengaja dieksekusi berlawanan.
+        # Analisa tetap dicatat sebagai orig_direction, tetapi order/veto/risk
+        # memakai execution_side yang sudah dibalik.
+        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
 
         px_live = price_live(sym)
         if px_live == 0:
@@ -1982,7 +1966,7 @@ def print_full():
 
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
     print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | FlipExit:{_stats['signal_flip_exits']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
-    print(f"    🕐 TIME ENGINE: Stage1 30m | Grace +60m if Float>0 | Max 90m | Grace<=0 => close")
+    print(f"    🕐 TIME ENGINE: HARD MAX 30m | Loss@30m -> BAN 1h | Profit@30m -> NO BAN")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2286,12 +2270,12 @@ def demo_preflight_account(syms):
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 — BINANCE FUTURES DEMO EXECUTION         ║")
-    print("║  1. Signal LONG -> REAL DEMO MARKET BUY                         ║")
-    print("║  2. Signal SHORT -> REAL DEMO MARKET SELL                       ║")
+    print("║  1. Signal LONG -> REAL DEMO MARKET SELL (INVERSE)             ║")
+    print("║  2. Signal SHORT -> REAL DEMO MARKET BUY (INVERSE)             ║")
     print("║  3. EXIT -> REAL DEMO reduceOnly MARKET                         ║")
     print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
     print("║  5. SL BAN 3 JAM + CLOSE POSISI LAIN YANG LOSS                  ║")
-    print("║  6. TIME: 30m -> GRACE +60m -> MAX 90m                         ║")
+    print("║  6. TIME: HARD MAX 30m | LOSS->BAN 1h | PROFIT->NO BAN         ║")
     print("║  7. Profit Guard + Signal Flip aktif                            ║")
     print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
