@@ -16,7 +16,7 @@ MODE:
 - SL = ban 30 menit + close posisi lain yang sedang floating loss
 - CASCADE_AFTER_SL = ban tambahan 1 jam (jika fitur cascade tetap aktif)
 - TIME_LIMIT = hard max 30 menit
-    * realized loss -> GLOBAL ENTRY MODE flip, TANPA BAN
+    * realized loss -> NEXT ENTRY opposite side, TANPA BAN
     * realized profit/flat -> tidak flip, TANPA BAN
 - Profit Guard dynamic berbasis ATH PnL
 """
@@ -783,39 +783,85 @@ _sl_ban_until = 0.0
 _sl_ban_reason = ""
 _sl_ban_trigger = ""
 
-# GLOBAL ENTRY MODE ---------------------------------------------------------
-# One mode for the whole bot, never one mode per position.
-# NORMAL  : strategy LONG->LONG, SHORT->SHORT
-# INVERSE : strategy LONG->SHORT, SHORT->LONG
+# ADAPTIVE NEXT-ENTRY DIRECTION --------------------------------------------
+# TIME_LIMIT loss does NOT permanently invert the strategy.
+# Instead, the next new entry is FORCED to the opposite side of the position
+# that just realized the TIME_LIMIT loss, regardless of the scanner signal.
+#
+# Example:
+#   LONG -> TIME_LIMIT loss -> next entry MUST be SHORT
+#   SHORT -> TIME_LIMIT loss -> next entry MUST be LONG
+#
+# After that forced entry is successfully opened, the force is consumed and
+# subsequent entries follow the normal strategy signal again (unless another
+# loss creates a new forced direction).
 _entry_mode_lock = threading.Lock()
-_entry_inverse_mode = False
+_forced_next_entry_side = None
 _entry_flip_count = 0
 _sl_flip_pending = 0
 
 
 def _entry_mode_name():
     with _entry_mode_lock:
-        return "INVERSE" if _entry_inverse_mode else "NORMAL"
+        forced = _forced_next_entry_side
+    if forced in ("LONG", "SHORT"):
+        return f"FORCE_{forced}"
+    return "NORMAL"
+
+
+def _entry_mode_status():
+    with _entry_mode_lock:
+        forced = _forced_next_entry_side
+        flips = _entry_flip_count
+    if forced in ("LONG", "SHORT"):
+        return f"FORCE_{forced} | flips:{flips}"
+    return f"NORMAL | flips:{flips}"
 
 
 def _get_execution_side(orig_direction):
+    """Return the side for a NEW entry.
+
+    A TIME_LIMIT loss has priority over the scanner:
+    the next entry is forced to the opposite side of the losing position.
+    Once consumed by a successful entry, the force is cleared.
+    """
+    _apply_pending_sl_flip_if_ready()
     with _entry_mode_lock:
-        inverse = _entry_inverse_mode
-    if inverse:
-        return "SHORT" if orig_direction == "LONG" else "LONG"
+        forced = _forced_next_entry_side
+    if forced in ("LONG", "SHORT"):
+        return forced
     return orig_direction
 
 
-def _toggle_entry_mode_after_time_loss(sym, pnl):
-    """TIME_LIMIT realized loss flips the GLOBAL mode immediately. No ban."""
-    global _entry_inverse_mode, _entry_flip_count
-    if pnl >= 0:
+def _set_forced_next_entry_after_time_loss(sym, losing_side, pnl):
+    """Force exactly the next successful NEW entry to the opposite side."""
+    global _forced_next_entry_side, _entry_flip_count
+    if pnl >= 0 or losing_side not in ("LONG", "SHORT"):
         return
+
+    forced = "SHORT" if losing_side == "LONG" else "LONG"
     with _entry_mode_lock:
-        _entry_inverse_mode = not _entry_inverse_mode
+        _forced_next_entry_side = forced
         _entry_flip_count += 1
-        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
-    print(f"  🔄 [TIME_LIMIT FLIP] {sym} realized {pnl:+.5f}U < 0 → GLOBAL ENTRY MODE:{mode} | flips:{_entry_flip_count}")
+        count = _entry_flip_count
+
+    print(
+        f"  🔄 [TIME_LIMIT LOSS] {sym} {losing_side} "
+        f"PnL:{pnl:+.5f}U < 0 → NEXT ENTRY WAJIB {forced} "
+        f"(abaikan signal scanner) | flips:{count}"
+    )
+
+
+def _consume_forced_entry_side(actual_side, sym):
+    """Clear the one-shot forced direction only after an entry really succeeds."""
+    global _forced_next_entry_side
+    with _entry_mode_lock:
+        if _forced_next_entry_side == actual_side:
+            _forced_next_entry_side = None
+            print(
+                f"  ✅ [FORCED ENTRY CONSUMED] {sym} berhasil {actual_side} "
+                f"→ entry berikutnya kembali mengikuti signal normal"
+            )
 
 
 def _schedule_sl_mode_flip(sym):
@@ -824,12 +870,15 @@ def _schedule_sl_mode_flip(sym):
     with _entry_mode_lock:
         _sl_flip_pending += 1
         pending = _sl_flip_pending
-        current = "INVERSE" if _entry_inverse_mode else "NORMAL"
+        forced = _forced_next_entry_side
+    current = f"FORCE_{forced}" if forced in ("LONG", "SHORT") else "NORMAL"
     print(f"  🔒 [SL FLIP PENDING] {sym} → mode tetap {current} selama SL_BAN 30m | pending:{pending}")
 
 
 def _apply_pending_sl_flip_if_ready():
-    global _entry_inverse_mode, _entry_flip_count, _sl_flip_pending
+    # Keep legacy SL flip behavior isolated. If a TIME_LIMIT force is active,
+    # it has priority for the next entry and is not overwritten by SL handling.
+    global _entry_flip_count, _sl_flip_pending
     if _sl_ban_remaining() > 0:
         return
     with _entry_mode_lock:
@@ -837,12 +886,13 @@ def _apply_pending_sl_flip_if_ready():
             return
         count = _sl_flip_pending
         _sl_flip_pending = 0
-        # Each SL event represents one requested global toggle.
-        if count % 2:
-            _entry_inverse_mode = not _entry_inverse_mode
         _entry_flip_count += count
-        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
-    print(f"  🔄 [SL FLIP ACTIVE] SL ban 30m selesai → GLOBAL ENTRY MODE:{mode} | flips:{_entry_flip_count}")
+        forced = _forced_next_entry_side
+        current = f"FORCE_{forced}" if forced in ("LONG", "SHORT") else "NORMAL"
+    print(
+        f"  🔄 [SL FLIP ACTIVE] SL ban 30m selesai → "
+        f"ENTRY MODE:{current} | flips:{_entry_flip_count}"
+    )
 
 _cascade_ban_until = 0.0
 _cascade_ban_trigger = ""
@@ -1690,6 +1740,10 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock:
             live_positions[sym] = pos
 
+        # Consume the forced direction ONLY after Binance DEMO entry is
+        # successfully verified and mirrored locally.
+        _consume_forced_entry_side(execution_side, sym)
+
         print(
             f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} | MODE:{_entry_mode_name()} | flips:{_entry_flip_count} @ {fill_price:.8g} "
             f"| qty:{actual_qty:.8g} | leverage:{LEVERAGE}x "
@@ -1847,9 +1901,11 @@ def live_close(sym, reason, price=None):
     elif reason == "CASCADE_AFTER_SL" and CASCADE_BAN_SECONDS > 0:
         _activate_aux_ban("CASCADE", CASCADE_BAN_SECONDS, sym)
     elif reason == "TIME_LIMIT":
-        # TIME_LIMIT LOSS: flip global mode, TANPA BAN.
-        # TIME_LIMIT profit/flat: tidak melakukan apa pun.
-        _toggle_entry_mode_after_time_loss(sym, pnl)
+        # TIME_LIMIT LOSS: force the NEXT NEW ENTRY to the opposite side
+        # of the position that just lost. No ban.
+        # TIME_LIMIT profit/flat: no force, no ban.
+        if pnl < 0:
+            _set_forced_next_entry_after_time_loss(sym, side, pnl)
 
     _maybe_activate_profit_guard()
 
@@ -2379,12 +2435,12 @@ def demo_preflight_account(syms):
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 — BINANCE FUTURES DEMO EXECUTION         ║")
-    print("║  1. Signal mengikuti GLOBAL ENTRY MODE                         ║")
-    print("║  2. TIME_LIMIT LOSS -> FLIP | SL -> FLIP AFTER 30m BAN         ║")
+    print("║  1. TIME_LIMIT LOSS -> NEXT ENTRY WAJIB LAWAN ARAH            ║")
+    print("║  2. TIME_LIMIT LOSS -> FORCE NEXT SIDE | SL -> FLIP 30m BAN ║")
     print("║  3. EXIT -> REAL DEMO reduceOnly MARKET                         ║")
     print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
     print("║  5. SL BAN 30 MENIT + CLOSE POSISI LAIN YANG LOSS              ║")
-    print("║  6. TIME: 30m | LOSS->FLIP | PROFIT/FLAT->NO FLIP/BAN        ║")
+    print("║  6. TIME: 30m | LOSS->NEXT OPPOSITE | PROFIT/FLAT->NO FLIP ║")
     print("║  7. Profit Guard aktif                                           ║")
     print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
     print("║  9. ORDER MARGIN: TARGET $2.00 | MAX $2.10 | LOT-SIZE AWARE ║")
