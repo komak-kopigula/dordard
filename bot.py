@@ -13,17 +13,13 @@ MODE:
 - TP = 3.5x ATR (clamped 2.5%-3.5%)
 - SL = 1.8x ATR (clamped 1.5%-2.5%)
 - Trailing Stop: removed
-- SL = ban 3 jam + close posisi lain yang sedang floating loss
-- CASCADE_AFTER_SL = ban tambahan 1 jam
-- TIME_LIMIT = 2-stage:
+- SL = ban 30 menit + close posisi lain yang sedang floating loss
+- CASCADE_AFTER_SL = close posisi lain yang loss, tanpa ban tambahan
+- TIME_LIMIT = hard max 30 menit: loss mengubah mode, tetapi tanpa ban:
     Stage 1: maksimal 30 menit
-      * profit > 0 pada menit ke-30 -> GRACE +60 menit
-      * profit <= 0 pada menit ke-30 -> TIME_LIMIT
-    Stage 2: tambahan 60 menit
-      * TP -> TP
-      * SL -> SL
-      * floating PnL <= 0 -> TIME_LIMIT
-      * 90 menit total -> TIME_LIMIT
+      * profit pada menit ke-30 -> TIME_LIMIT tanpa perubahan mode
+      * loss pada menit ke-30 -> TIME_LIMIT + FLIP mode, tanpa ban:
+      * tidak ada TIME_BAN dan tidak ada mode flip
 - Profit Guard dynamic berbasis ATH PnL
 """
 
@@ -115,9 +111,9 @@ ORDER_USDT    = 2.0
 MAX_POSITIONS = 2
 
 # ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
-SL_BAN_SECONDS = 3 * 60 * 60
-CASCADE_BAN_SECONDS = 1 * 60 * 60
-TIME_LIMIT_BAN_SECONDS = 1 * 60 * 60
+SL_BAN_SECONDS = 30 * 60
+CASCADE_BAN_SECONDS = 0
+TIME_LIMIT_BAN_SECONDS = 0
 SL_LIQUIDATE_LOSERS = True
 
 # ── PROFIT GUARD / ATH GIVEBACK PROTECTION ─────────────────────────────────
@@ -133,9 +129,8 @@ PROFIT_GUARD_CLOSE_LOSERS = True
 
 # ── HARD 30-MINUTE TIME LIMIT ──────────────────────────────────────────────
 # Semua posisi wajib ditutup maksimal pada menit ke-30.
-# - Floating loss pada menit ke-30 -> TIME_LIMIT + BAN ENTRY 1 jam
-# - Floating profit pada menit ke-30 -> TIME_LIMIT, TANPA BAN
-# - TP / SL / exit lain sebelum 30m -> tidak menambah TIME_BAN
+# - Floating loss/profit pada menit ke-30 -> TIME_LIMIT, TANPA BAN dan TANPA FLIP
+# - Hanya SL yang mengaktifkan BAN ENTRY 30 menit dan pending FLIP mode
 TIME_LIMIT_STAGE1_SECONDS = 30 * 60
 TIME_LIMIT_GRACE_SECONDS = 0
 MAX_TOTAL_HOLD_SECONDS = TIME_LIMIT_STAGE1_SECONDS
@@ -793,6 +788,14 @@ _profit_guard_triggered_ath = 0.0
 _profit_guard_in_progress = False
 _sl_cascade_close_count = 0
 
+# Adaptive entry mode:
+# NORMAL = ikuti signal asli; INVERSE = lawan signal asli.
+# Mode berubah setelah SL loss (diterapkan setelah ban 30 menit) atau TIME_LIMIT loss (langsung).
+_entry_mode_lock = threading.Lock()
+_entry_inverse_mode = False
+_pending_sl_flip = False
+_entry_flip_count = 0
+
 
 def _log_err(tag, e, cooldown=10):
     now = time.time()
@@ -1307,6 +1310,54 @@ def _sl_ban_status():
     return _fmt_ban("SL_BAN", rem)
 
 
+def _apply_pending_sl_flip_if_ready():
+    """Apply the SL-triggered mode flip only after the 30-minute SL ban expires."""
+    global _entry_inverse_mode, _pending_sl_flip, _entry_flip_count
+    if _sl_ban_remaining() > 0:
+        return
+    with _entry_mode_lock:
+        if not _pending_sl_flip:
+            return
+        _entry_inverse_mode = not _entry_inverse_mode
+        _pending_sl_flip = False
+        _entry_flip_count += 1
+        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+    print(f"  🔄 [SL FLIP APPLIED] Ban 30m selesai → ENTRY MODE:{mode} | flip #{_entry_flip_count}")
+
+
+def _toggle_entry_mode_after_loss(reason: str, pnl: float):
+    """Flip NORMAL <-> INVERSE after a realized losing SL or TIME_LIMIT exit."""
+    global _entry_inverse_mode, _entry_flip_count
+    if pnl >= 0:
+        return
+    with _entry_mode_lock:
+        _entry_inverse_mode = not _entry_inverse_mode
+        _entry_flip_count += 1
+        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+    print(
+        f"  🔄 [{reason} LOSS FLIP] PnL:{pnl:+.5f}U → ENTRY MODE:{mode} "
+        f"| flip #{_entry_flip_count}"
+    )
+
+
+def _get_execution_side(orig_direction: str) -> str:
+    """Return execution side according to the current adaptive entry mode."""
+    _apply_pending_sl_flip_if_ready()
+    with _entry_mode_lock:
+        inverse = _entry_inverse_mode
+    return ("SHORT" if orig_direction == "LONG" else "LONG") if inverse else orig_direction
+
+
+def _entry_mode_status() -> str:
+    with _entry_mode_lock:
+        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+        pending = _pending_sl_flip
+        flips = _entry_flip_count
+    if pending and _sl_ban_remaining() > 0:
+        return f"{mode} | FLIP_PENDING | flips:{flips}"
+    return f"{mode} | flips:{flips}"
+
+
 def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
     global _cascade_ban_until, _cascade_ban_trigger
     global _time_limit_ban_until, _time_limit_ban_trigger
@@ -1413,7 +1464,7 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
         _stats["sl_ban_count"] += 1
         ban_until_local = _sl_ban_until
 
-    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — DEMO entry dikunci 3 JAM sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
+    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — DEMO entry dikunci 30 MENIT sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
     if SL_LIQUIDATE_LOSERS:
         _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
 
@@ -1495,8 +1546,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         raise RuntimeError("DEMO_TRADING must remain True")
     if orig_direction not in ("LONG", "SHORT"):
         return
-    # INVERSE ENTRY: signal LONG -> actual SHORT, signal SHORT -> actual LONG.
-    execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+    # Adaptive entry: NORMAL mengikuti signal; INVERSE melawan signal.
+    execution_side = _get_execution_side(orig_direction)
     if _order_state_uncertain:
         print(f"  ⛔ [{sym}] ENTRY DIBLOKIR: ORDER_STATE_UNKNOWN")
         return
@@ -1564,7 +1615,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             live_positions[sym] = pos
 
         print(
-            f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} @ {fill_price:.8g} "
+            f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} | MODE:{_entry_mode_status()} @ {fill_price:.8g} "
             f"| qty:{actual_qty:.8g} | leverage:{LEVERAGE}x "
             f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
         )
@@ -1715,13 +1766,24 @@ def live_close(sym, reason, price=None):
     })
 
     if reason == "SL":
+        # SL adalah satu-satunya exit yang memicu ban + perubahan mode.
+        # Flip ditunda sampai ban 30 menit benar-benar selesai.
+        global _pending_sl_flip
         _activate_sl_ban_and_liquidate(sym)
+        with _entry_mode_lock:
+            _pending_sl_flip = True
+        print(f"  🔄 [SL FLIP PENDING] {sym} → mode akan dibalik setelah ban SL 30 menit selesai")
     elif reason == "CASCADE_AFTER_SL":
-        _activate_aux_ban("CASCADE", CASCADE_BAN_SECONDS, sym)
-    elif reason == "TIME_LIMIT" and pos.get("_time_limit_ban", False):
-        # Hanya TIME_LIMIT yang benar-benar LOSS pada menit ke-30
-        # yang mengaktifkan ban entry 1 jam. Profit-at-time-limit tidak ban.
-        _activate_aux_ban("TIME_LIMIT", TIME_LIMIT_BAN_SECONDS, sym)
+        # Posisi lain boleh ditutup karena cascade, tetapi tidak membuat ban tambahan.
+        pass
+    elif reason == "TIME_LIMIT":
+        # TIME_LIMIT loss mengubah mode, tetapi TIDAK membuat ban.
+        # TIME_LIMIT profit/flat tidak mengubah mode.
+        if pnl < 0:
+            _toggle_entry_mode_after_loss("TIME_LIMIT", pnl)
+            print(f"  ⏰ [TIME_LIMIT LOSS] {sym} → TANPA BAN | mode baru {_entry_mode_status()}")
+        else:
+            print(f"  ⏰ [TIME_LIMIT PROFIT/FLAT] {sym} → TANPA BAN | mode tetap {_entry_mode_status()}")
 
     _maybe_activate_profit_guard()
 
@@ -1734,26 +1796,16 @@ def live_close(sym, reason, price=None):
 
 
 def _check_time_limit_stage(sym, pos, px):
-    """Hard 30-minute max hold. Loss at timeout gets 1h entry ban; profit does not."""
+    """Hard 30-minute max hold. Loss flips mode; TIME_LIMIT never bans."""
     hold_time = time.time() - pos["open_time"]
     if hold_time < TIME_LIMIT_STAGE1_SECONDS:
         return False
 
     floating_pnl = _estimate_floating_pnl(pos, px)
-    # Mark the exact timeout state before live_close() records the trade.
-    # This prevents a profitable TIME_LIMIT close from receiving a TIME_BAN.
-    pos["_time_limit_ban"] = floating_pnl < 0
-
-    if floating_pnl < 0:
-        print(
-            f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
-            f"Float:{floating_pnl:+.5f}U < 0 → close + TIME_BAN 1 jam"
-        )
-    else:
-        print(
-            f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
-            f"Float:{floating_pnl:+.5f}U >= 0 → close TANPA TIME_BAN"
-        )
+    print(
+        f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
+        f"Float:{floating_pnl:+.5f}U → close | loss akan FLIP, tanpa BAN"
+    )
 
     live_close(sym, "TIME_LIMIT", px)
     return True
@@ -1826,10 +1878,9 @@ def scan_one(sym):
             return None
         if orig_direction not in ("LONG", "SHORT"):
             return None
-        # INVERSE ENTRY MODE: hasil analisa sengaja dieksekusi berlawanan.
-        # Analisa tetap dicatat sebagai orig_direction, tetapi order/veto/risk
-        # memakai execution_side yang sudah dibalik.
-        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+        # Adaptive entry mode: hasil analisa bisa NORMAL atau INVERSE.
+        # Order/veto/risk selalu memakai execution_side yang aktif.
+        execution_side = _get_execution_side(orig_direction)
 
         px_live = price_live(sym)
         if px_live == 0:
@@ -1936,7 +1987,8 @@ def print_full():
 
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
     print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
-    print(f"    🕐 TIME ENGINE: HARD MAX 30m | Loss@30m -> BAN 1h | Profit@30m -> NO BAN")
+    print(f"    🔄 ENTRY MODE: {_entry_mode_status()} | SL BAN: 30m")
+    print(f"    🕐 TIME ENGINE: HARD MAX 30m | LOSS -> FLIP | NO BAN")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2240,12 +2292,12 @@ def demo_preflight_account(syms):
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 — BINANCE FUTURES DEMO EXECUTION         ║")
-    print("║  1. Signal LONG -> REAL DEMO MARKET SELL (INVERSE)             ║")
-    print("║  2. Signal SHORT -> REAL DEMO MARKET BUY (INVERSE)             ║")
+    print("║  1. Signal mengikuti MODE (NORMAL/INVERSE)             ║")
+    print("║  2. Mode entry berubah hanya setelah SL + ban 30m             ║")
     print("║  3. EXIT -> REAL DEMO reduceOnly MARKET                         ║")
     print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
-    print("║  5. SL BAN 3 JAM + CLOSE POSISI LAIN YANG LOSS                  ║")
-    print("║  6. TIME: HARD MAX 30m | LOSS->BAN 1h | PROFIT->NO BAN         ║")
+    print("║  5. SL BAN 30 MENIT + FLIP MODE SETELAH BAN                  ║")
+    print("║  6. TIME: HARD MAX 30m | LOSS->FLIP | NO BAN              ║")
     print("║  7. Profit Guard aktif                                           ║")
     print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
