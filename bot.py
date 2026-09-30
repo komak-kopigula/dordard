@@ -14,12 +14,10 @@ MODE:
 - SL = 1.8x ATR (clamped 1.5%-2.5%)
 - Trailing Stop: removed
 - SL = ban 30 menit + close posisi lain yang sedang floating loss
-- CASCADE_AFTER_SL = close posisi lain yang loss, tanpa ban tambahan
-- TIME_LIMIT = hard max 30 menit: loss mengubah mode, tetapi tanpa ban:
-    Stage 1: maksimal 30 menit
-      * profit pada menit ke-30 -> TIME_LIMIT tanpa perubahan mode
-      * loss pada menit ke-30 -> TIME_LIMIT + FLIP mode, tanpa ban:
-      * tidak ada TIME_BAN dan tidak ada mode flip
+- CASCADE_AFTER_SL = ban tambahan 1 jam (jika fitur cascade tetap aktif)
+- TIME_LIMIT = hard max 30 menit
+    * realized loss -> GLOBAL ENTRY MODE flip, TANPA BAN
+    * realized profit/flat -> tidak flip, TANPA BAN
 - Profit Guard dynamic berbasis ATH PnL
 """
 
@@ -112,8 +110,8 @@ MAX_POSITIONS = 2
 
 # ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
 SL_BAN_SECONDS = 30 * 60
-CASCADE_BAN_SECONDS = 0
-TIME_LIMIT_BAN_SECONDS = 0
+CASCADE_BAN_SECONDS = 0  # no extra entry ban; SL ban is exactly 30 minutes
+TIME_LIMIT_BAN_SECONDS = 0  # deprecated: TIME_LIMIT tidak pernah membuat ban
 SL_LIQUIDATE_LOSERS = True
 
 # ── PROFIT GUARD / ATH GIVEBACK PROTECTION ─────────────────────────────────
@@ -129,8 +127,9 @@ PROFIT_GUARD_CLOSE_LOSERS = True
 
 # ── HARD 30-MINUTE TIME LIMIT ──────────────────────────────────────────────
 # Semua posisi wajib ditutup maksimal pada menit ke-30.
-# - Floating loss/profit pada menit ke-30 -> TIME_LIMIT, TANPA BAN dan TANPA FLIP
-# - Hanya SL yang mengaktifkan BAN ENTRY 30 menit dan pending FLIP mode
+# - Floating loss pada menit ke-30 -> TIME_LIMIT + FLIP MODE
+# - Floating profit/flat pada menit ke-30 -> TIME_LIMIT, TANPA FLIP/BAN
+# - TP / SL / exit lain sebelum 30m -> tidak menambah TIME_BAN
 TIME_LIMIT_STAGE1_SECONDS = 30 * 60
 TIME_LIMIT_GRACE_SECONDS = 0
 MAX_TOTAL_HOLD_SECONDS = TIME_LIMIT_STAGE1_SECONDS
@@ -778,6 +777,68 @@ _sl_ban_lock = threading.Lock()
 _sl_ban_until = 0.0
 _sl_ban_reason = ""
 _sl_ban_trigger = ""
+
+# GLOBAL ENTRY MODE ---------------------------------------------------------
+# One mode for the whole bot, never one mode per position.
+# NORMAL  : strategy LONG->LONG, SHORT->SHORT
+# INVERSE : strategy LONG->SHORT, SHORT->LONG
+_entry_mode_lock = threading.Lock()
+_entry_inverse_mode = False
+_entry_flip_count = 0
+_sl_flip_pending = 0
+
+
+def _entry_mode_name():
+    with _entry_mode_lock:
+        return "INVERSE" if _entry_inverse_mode else "NORMAL"
+
+
+def _get_execution_side(orig_direction):
+    with _entry_mode_lock:
+        inverse = _entry_inverse_mode
+    if inverse:
+        return "SHORT" if orig_direction == "LONG" else "LONG"
+    return orig_direction
+
+
+def _toggle_entry_mode_after_time_loss(sym, pnl):
+    """TIME_LIMIT realized loss flips the GLOBAL mode immediately. No ban."""
+    global _entry_inverse_mode, _entry_flip_count
+    if pnl >= 0:
+        return
+    with _entry_mode_lock:
+        _entry_inverse_mode = not _entry_inverse_mode
+        _entry_flip_count += 1
+        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+    print(f"  🔄 [TIME_LIMIT FLIP] {sym} realized {pnl:+.5f}U < 0 → GLOBAL ENTRY MODE:{mode} | flips:{_entry_flip_count}")
+
+
+def _schedule_sl_mode_flip(sym):
+    """SL queues one global mode flip; it is applied only after the 30m SL ban."""
+    global _sl_flip_pending
+    with _entry_mode_lock:
+        _sl_flip_pending += 1
+        pending = _sl_flip_pending
+        current = "INVERSE" if _entry_inverse_mode else "NORMAL"
+    print(f"  🔒 [SL FLIP PENDING] {sym} → mode tetap {current} selama SL_BAN 30m | pending:{pending}")
+
+
+def _apply_pending_sl_flip_if_ready():
+    global _entry_inverse_mode, _entry_flip_count, _sl_flip_pending
+    if _sl_ban_remaining() > 0:
+        return
+    with _entry_mode_lock:
+        if _sl_flip_pending <= 0:
+            return
+        count = _sl_flip_pending
+        _sl_flip_pending = 0
+        # Each SL event represents one requested global toggle.
+        if count % 2:
+            _entry_inverse_mode = not _entry_inverse_mode
+        _entry_flip_count += count
+        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+    print(f"  🔄 [SL FLIP ACTIVE] SL ban 30m selesai → GLOBAL ENTRY MODE:{mode} | flips:{_entry_flip_count}")
+
 _cascade_ban_until = 0.0
 _cascade_ban_trigger = ""
 _time_limit_ban_until = 0.0
@@ -787,16 +848,6 @@ _profit_guard_trigger = ""
 _profit_guard_triggered_ath = 0.0
 _profit_guard_in_progress = False
 _sl_cascade_close_count = 0
-
-# Adaptive entry mode:
-# NORMAL = ikuti signal asli; INVERSE = lawan signal asli.
-# Mode berubah setelah SL loss (diterapkan setelah ban 30 menit) atau TIME_LIMIT loss (langsung).
-_entry_mode_lock = threading.Lock()
-_entry_inverse_mode = False
-_pending_sl_flip = False
-_entry_flip_count = 0
-_last_time_limit_flip_ts = 0.0
-TIME_LIMIT_FLIP_DEBOUNCE_SECONDS = 5.0
 
 
 def _log_err(tag, e, cooldown=10):
@@ -917,49 +968,99 @@ def _get_symbol_rules(symbol):
     raise RuntimeError(f"Symbol {symbol} tidak ditemukan di DEMO exchangeInfo")
 
 
-DEMO_MIN_NOTIONAL_USDT = 50.0
+# Binance Futures DEMO minimum-notional is read from exchangeInfo per symbol.
+# Do NOT hard-code 50 USDT: that can make valid low-priced/large-tick symbols
+# impossible to enter with ORDER_USDT ~= 2.0 at 25x.
 DEMO_MAX_MARGIN_USDT = 2.10
-DEMO_MIN_NOTIONAL_BUFFER = 1.00
+DEMO_MIN_MARGIN_USDT = 1.90
+DEMO_TARGET_MARGIN_USDT = 2.00
+DEMO_NOTIONAL_BUFFER_USDT = 0.05
+
+
+def _get_symbol_rules(symbol):
+    """Return quantity + notional rules from Binance DEMO exchangeInfo."""
+    cached = _symbol_rules_cache.get(symbol)
+    if cached:
+        return cached
+    info = _rest_call("futures_exchange_info_rules", client.futures_exchange_info)
+    for item in info.get("symbols", []):
+        if item.get("symbol") != symbol:
+            continue
+        filters = {f.get("filterType"): f for f in item.get("filters", [])}
+        lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE") or {}
+        notional_filter = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
+        min_notional = float(
+            notional_filter.get("minNotional", 0)
+            or notional_filter.get("notional", 0)
+            or 0
+        )
+        rules = {
+            "min_qty": float(lot.get("minQty", 0) or 0),
+            "max_qty": float(lot.get("maxQty", 0) or 0),
+            "step_size": float(lot.get("stepSize", 0) or 0),
+            "precision": int(item.get("quantityPrecision", 8)),
+            "min_notional": min_notional,
+        }
+        _symbol_rules_cache[symbol] = rules
+        return rules
+    raise RuntimeError(f"Symbol {symbol} tidak ditemukan di DEMO exchangeInfo")
+
+
+def _round_qty_up(q, step, precision):
+    if q <= 0:
+        return 0.0
+    if step > 0:
+        q = math.ceil((q - 1e-15) / step) * step
+    return round(q, precision)
 
 
 def qty(symbol, price):
-    """Calculate a DEMO MARKET quantity that satisfies Binance min-notional and lot step."""
+    """Build the smallest valid quantity near $2 margin, capped at $2.10.
+
+    Priority:
+      1. satisfy symbol LOT_SIZE/MARKET_LOT_SIZE;
+      2. satisfy symbol MIN_NOTIONAL/NOTIONAL if present;
+      3. target ~2.00 USDT margin at current leverage;
+      4. never silently exceed 2.10 USDT initial margin.
+    """
     if price <= 0:
         return 0.0
+
     rules = _get_symbol_rules(symbol)
     step = rules["step_size"]
     min_qty = rules["min_qty"]
+    max_qty = rules["max_qty"]
     precision = rules["precision"]
+    min_notional = rules["min_notional"]
 
-    # Keep initial margin around ORDER_USDT while satisfying Binance minimum
-    # notional. With 25x leverage, 50 USDT notional = exactly 2 USDT margin.
-    target_notional = max(ORDER_USDT * LEVERAGE, DEMO_MIN_NOTIONAL_USDT * DEMO_MIN_NOTIONAL_BUFFER)
+    target_notional = DEMO_TARGET_MARGIN_USDT * LEVERAGE
     max_notional = DEMO_MAX_MARGIN_USDT * LEVERAGE
-    raw = target_notional / price
 
-    # CEIL to the lot step so the final rounded quantity does not fall below
-    # the minimum notional after exchange rounding.
-    if step > 0:
-        raw = math.ceil((raw - 1e-15) / step) * step
+    # Use the exchange's actual minimum, not an artificial 50 USDT floor.
+    required_notional = max(target_notional, min_notional + DEMO_NOTIONAL_BUFFER_USDT)
+    raw = required_notional / price
+    q_val = _round_qty_up(raw, step, precision)
 
-    q_val = round(raw, precision)
-    if min_qty > 0 and q_val < min_qty:
-        q_val = min_qty
+    if min_qty > 0:
+        q_val = max(q_val, min_qty)
+        q_val = _round_qty_up(q_val, step, precision)
 
-    # One final check in case precision/step rounding still leaves notional
-    # below the exchange minimum.
-    if step > 0:
-        while q_val * price < DEMO_MIN_NOTIONAL_USDT * DEMO_MIN_NOTIONAL_BUFFER:
-            q_val = round(q_val + step, precision)
+    # Re-check after rounding: increase by exactly one lot until valid.
+    while q_val > 0 and q_val * price + 1e-9 < min_notional + DEMO_NOTIONAL_BUFFER_USDT:
+        if step <= 0:
+            break
+        q_val = round(q_val + step, precision)
 
-    # Never allow lot-step/minQty rounding to push initial margin above the
-    # requested 2.10 USDT ceiling. Such a symbol is skipped rather than
-    # silently opening a larger position.
-    if q_val * price > max_notional + 1e-9:
+    if max_qty > 0 and q_val > max_qty:
+        return 0.0
+
+    # If the symbol's lot step makes the next valid quantity exceed the user's
+    # margin ceiling, do not open an unexpectedly large position.
+    margin = (q_val * price) / LEVERAGE if q_val > 0 else 0.0
+    if margin > DEMO_MAX_MARGIN_USDT + 1e-9:
         return 0.0
 
     return q_val
-
 
 def _fmt_qty(symbol, q_val):
     precision = get_precision(symbol)
@@ -1297,7 +1398,6 @@ def _circuit_snapshot():
         items = [
             ("SL_BAN", max(0.0, _sl_ban_until - now)),
             ("CASCADE_BAN", max(0.0, _cascade_ban_until - now)),
-            ("TIME_BAN", max(0.0, _time_limit_ban_until - now)),
             ("PROFIT_GUARD", max(0.0, _profit_guard_until - now)),
         ]
     active = [(name, rem) for name, rem in items if rem > 0]
@@ -1312,68 +1412,6 @@ def _sl_ban_status():
     return _fmt_ban("SL_BAN", rem)
 
 
-def _apply_pending_sl_flip_if_ready():
-    """Apply the SL-triggered mode flip only after the 30-minute SL ban expires."""
-    global _entry_inverse_mode, _pending_sl_flip, _entry_flip_count
-    if _sl_ban_remaining() > 0:
-        return
-    with _entry_mode_lock:
-        if not _pending_sl_flip:
-            return
-        _entry_inverse_mode = not _entry_inverse_mode
-        _pending_sl_flip = False
-        _entry_flip_count += 1
-        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
-    print(f"  🔄 [SL FLIP APPLIED] Ban 30m selesai → ENTRY MODE:{mode} | flip #{_entry_flip_count}")
-
-
-def _toggle_entry_mode_after_loss(reason: str, pnl: float):
-    """Flip once per loss event; simultaneous TIME_LIMIT losses cannot cancel each other."""
-    global _entry_inverse_mode, _entry_flip_count, _last_time_limit_flip_ts
-    if pnl >= 0:
-        return False
-
-    now = time.time()
-    with _entry_mode_lock:
-        if reason == "TIME_LIMIT" and (now - _last_time_limit_flip_ts) < TIME_LIMIT_FLIP_DEBOUNCE_SECONDS:
-            mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
-            print(
-                f"  ↪️ [TIME_LIMIT LOSS] PnL:{pnl:+.5f}U → flip sudah dilakukan "
-                f"{now - _last_time_limit_flip_ts:.1f}s lalu | MODE tetap:{mode}"
-            )
-            return False
-
-        _entry_inverse_mode = not _entry_inverse_mode
-        _entry_flip_count += 1
-        if reason == "TIME_LIMIT":
-            _last_time_limit_flip_ts = now
-        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
-
-    print(
-        f"  🔄 [{reason} LOSS FLIP] PnL:{pnl:+.5f}U → ENTRY MODE:{mode} "
-        f"| flip #{_entry_flip_count}"
-    )
-    return True
-
-
-def _get_execution_side(orig_direction: str) -> str:
-    """Return execution side according to the current adaptive entry mode."""
-    _apply_pending_sl_flip_if_ready()
-    with _entry_mode_lock:
-        inverse = _entry_inverse_mode
-    return ("SHORT" if orig_direction == "LONG" else "LONG") if inverse else orig_direction
-
-
-def _entry_mode_status() -> str:
-    with _entry_mode_lock:
-        mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
-        pending = _pending_sl_flip
-        flips = _entry_flip_count
-    if pending and _sl_ban_remaining() > 0:
-        return f"{mode} | FLIP_PENDING | flips:{flips}"
-    return f"{mode} | flips:{flips}"
-
-
 def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
     global _cascade_ban_until, _cascade_ban_trigger
     global _time_limit_ban_until, _time_limit_ban_trigger
@@ -1386,11 +1424,6 @@ def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
             _cascade_ban_trigger = trigger_sym
             _stats["cascade_ban_count"] += 1
             label = "CASCADE_BAN"
-        elif kind == "TIME_LIMIT":
-            _time_limit_ban_until = max(_time_limit_ban_until, until)
-            _time_limit_ban_trigger = trigger_sym
-            _stats["time_limit_ban_count"] += 1
-            label = "TIME_BAN"
         elif kind == "PROFIT_GUARD":
             _profit_guard_until = max(_profit_guard_until, until)
             _profit_guard_trigger = trigger_sym
@@ -1400,7 +1433,6 @@ def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
             return
         active_until = {
             "CASCADE_BAN": _cascade_ban_until,
-            "TIME_BAN": _time_limit_ban_until,
             "PROFIT_GUARD": _profit_guard_until,
         }[label]
 
@@ -1481,6 +1513,7 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
         ban_until_local = _sl_ban_until
 
     print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — DEMO entry dikunci 30 MENIT sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
+    _schedule_sl_mode_flip(trigger_sym)
     if SL_LIQUIDATE_LOSERS:
         _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
 
@@ -1526,6 +1559,7 @@ def _maybe_activate_profit_guard():
 
 def ks_check():
     k, now = _ks, time.time()
+    _apply_pending_sl_flip_if_ready()
     circuit, remaining = _circuit_snapshot()
     if remaining > 0:
         return True, circuit
@@ -1562,7 +1596,6 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         raise RuntimeError("DEMO_TRADING must remain True")
     if orig_direction not in ("LONG", "SHORT"):
         return
-    # Adaptive entry: NORMAL mengikuti signal; INVERSE melawan signal.
     execution_side = _get_execution_side(orig_direction)
     if _order_state_uncertain:
         print(f"  ⛔ [{sym}] ENTRY DIBLOKIR: ORDER_STATE_UNKNOWN")
@@ -1631,7 +1664,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             live_positions[sym] = pos
 
         print(
-            f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} | MODE:{_entry_mode_status()} @ {fill_price:.8g} "
+            f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} | MODE:{_entry_mode_name()} | flips:{_entry_flip_count} @ {fill_price:.8g} "
             f"| qty:{actual_qty:.8g} | leverage:{LEVERAGE}x "
             f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
         )
@@ -1782,24 +1815,14 @@ def live_close(sym, reason, price=None):
     })
 
     if reason == "SL":
-        # SL adalah satu-satunya exit yang memicu ban + perubahan mode.
-        # Flip ditunda sampai ban 30 menit benar-benar selesai.
-        global _pending_sl_flip
+        # SL: ban 30m dulu. Mode flip baru aktif setelah ban selesai.
         _activate_sl_ban_and_liquidate(sym)
-        with _entry_mode_lock:
-            _pending_sl_flip = True
-        print(f"  🔄 [SL FLIP PENDING] {sym} → mode akan dibalik setelah ban SL 30 menit selesai")
-    elif reason == "CASCADE_AFTER_SL":
-        # Posisi lain boleh ditutup karena cascade, tetapi tidak membuat ban tambahan.
-        pass
+    elif reason == "CASCADE_AFTER_SL" and CASCADE_BAN_SECONDS > 0:
+        _activate_aux_ban("CASCADE", CASCADE_BAN_SECONDS, sym)
     elif reason == "TIME_LIMIT":
-        # TIME_LIMIT loss mengubah mode, tetapi TIDAK membuat ban.
-        # TIME_LIMIT profit/flat tidak mengubah mode.
-        if pnl < 0:
-            _toggle_entry_mode_after_loss("TIME_LIMIT", pnl)
-            print(f"  ⏰ [TIME_LIMIT LOSS] {sym} → TANPA BAN | mode baru {_entry_mode_status()}")
-        else:
-            print(f"  ⏰ [TIME_LIMIT PROFIT/FLAT] {sym} → TANPA BAN | mode tetap {_entry_mode_status()}")
+        # TIME_LIMIT LOSS: flip global mode, TANPA BAN.
+        # TIME_LIMIT profit/flat: tidak melakukan apa pun.
+        _toggle_entry_mode_after_time_loss(sym, pnl)
 
     _maybe_activate_profit_guard()
 
@@ -1812,20 +1835,25 @@ def live_close(sym, reason, price=None):
 
 
 def _check_time_limit_stage(sym, pos, px):
-    """Hard 30-minute max hold. Loss flips mode; TIME_LIMIT never bans."""
+    """Hard 30-minute max hold. TIME_LIMIT never creates an entry ban."""
     hold_time = time.time() - pos["open_time"]
     if hold_time < TIME_LIMIT_STAGE1_SECONDS:
         return False
 
     floating_pnl = _estimate_floating_pnl(pos, px)
-    print(
-        f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
-        f"Float:{floating_pnl:+.5f}U → close | loss akan FLIP, tanpa BAN"
-    )
+    if floating_pnl < 0:
+        print(
+            f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
+            f"Float:{floating_pnl:+.5f}U < 0 → close + GLOBAL FLIP"
+        )
+    else:
+        print(
+            f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
+            f"Float:{floating_pnl:+.5f}U >= 0 → close TANPA FLIP/BAN"
+        )
 
     live_close(sym, "TIME_LIMIT", px)
     return True
-
 
 
 def monitor_positions():
@@ -1894,8 +1922,7 @@ def scan_one(sym):
             return None
         if orig_direction not in ("LONG", "SHORT"):
             return None
-        # Adaptive entry mode: hasil analisa bisa NORMAL atau INVERSE.
-        # Order/veto/risk selalu memakai execution_side yang aktif.
+        # Global mode menentukan arah order; posisi yang sudah terbuka tidak disentuh.
         execution_side = _get_execution_side(orig_direction)
 
         px_live = price_live(sym)
@@ -2003,8 +2030,7 @@ def print_full():
 
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
     print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
-    print(f"    🔄 ENTRY MODE: {_entry_mode_status()} | SL BAN: 30m")
-    print(f"    🕐 TIME ENGINE: HARD MAX 30m | LOSS -> ONE FLIP | NO BAN")
+    print(f"    🕐 TIME ENGINE: HARD MAX 30m | LOSS -> GLOBAL FLIP | PROFIT/FLAT -> NO FLIP/BAN")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2308,14 +2334,15 @@ def demo_preflight_account(syms):
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
     print("║  💎 BOT SCALPING v22.0 — BINANCE FUTURES DEMO EXECUTION         ║")
-    print("║  1. Signal mengikuti MODE (NORMAL/INVERSE)             ║")
-    print("║  2. Mode entry berubah hanya setelah SL + ban 30m             ║")
+    print("║  1. Signal mengikuti GLOBAL ENTRY MODE                         ║")
+    print("║  2. TIME_LIMIT LOSS -> FLIP | SL -> FLIP AFTER 30m BAN         ║")
     print("║  3. EXIT -> REAL DEMO reduceOnly MARKET                         ║")
     print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
-    print("║  5. SL BAN 30 MENIT + FLIP MODE SETELAH BAN                  ║")
-    print("║  6. TIME: HARD MAX 30m | LOSS->FLIP | NO BAN              ║")
+    print("║  5. SL BAN 30 MENIT + CLOSE POSISI LAIN YANG LOSS              ║")
+    print("║  6. TIME: 30m | LOSS->FLIP | PROFIT/FLAT->NO FLIP/BAN        ║")
     print("║  7. Profit Guard aktif                                           ║")
     print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
+    print("║  9. ORDER MARGIN: TARGET $2.00 | MAX $2.10 | LOT-SIZE AWARE ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
     try:
