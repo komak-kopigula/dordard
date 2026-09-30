@@ -201,7 +201,7 @@ SYMBOLS = [
     "LINKUSDT", "MATICUSDT", "LTCUSDT", "ATOMUSDT", "UNIUSDT",
     "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
     "SUIUSDT", "SEIUSDT", "FETUSDT", "WLDUSDT", "AAVEUSDT",
-    "ORDIUSDT", "TONUSDT", "1000PEPEUSDT", "WIFUSDT", "JUPUSDT",
+    "ORDIUSDT", "1000PEPEUSDT", "WIFUSDT", "JUPUSDT",
     "FTMUSDT", "SANDUSDT", "MANAUSDT", "GALAUSDT", "APEUSDT",
     "CRVUSDT", "1000SHIBUSDT", "COMPUSDT", "MKRUSDT", "SNXUSDT",
 ]
@@ -795,6 +795,8 @@ _entry_mode_lock = threading.Lock()
 _entry_inverse_mode = False
 _pending_sl_flip = False
 _entry_flip_count = 0
+_last_time_limit_flip_ts = 0.0
+TIME_LIMIT_FLIP_DEBOUNCE_SECONDS = 5.0
 
 
 def _log_err(tag, e, cooldown=10):
@@ -1326,18 +1328,32 @@ def _apply_pending_sl_flip_if_ready():
 
 
 def _toggle_entry_mode_after_loss(reason: str, pnl: float):
-    """Flip NORMAL <-> INVERSE after a realized losing SL or TIME_LIMIT exit."""
-    global _entry_inverse_mode, _entry_flip_count
+    """Flip once per loss event; simultaneous TIME_LIMIT losses cannot cancel each other."""
+    global _entry_inverse_mode, _entry_flip_count, _last_time_limit_flip_ts
     if pnl >= 0:
-        return
+        return False
+
+    now = time.time()
     with _entry_mode_lock:
+        if reason == "TIME_LIMIT" and (now - _last_time_limit_flip_ts) < TIME_LIMIT_FLIP_DEBOUNCE_SECONDS:
+            mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+            print(
+                f"  ↪️ [TIME_LIMIT LOSS] PnL:{pnl:+.5f}U → flip sudah dilakukan "
+                f"{now - _last_time_limit_flip_ts:.1f}s lalu | MODE tetap:{mode}"
+            )
+            return False
+
         _entry_inverse_mode = not _entry_inverse_mode
         _entry_flip_count += 1
+        if reason == "TIME_LIMIT":
+            _last_time_limit_flip_ts = now
         mode = "INVERSE" if _entry_inverse_mode else "NORMAL"
+
     print(
         f"  🔄 [{reason} LOSS FLIP] PnL:{pnl:+.5f}U → ENTRY MODE:{mode} "
         f"| flip #{_entry_flip_count}"
     )
+    return True
 
 
 def _get_execution_side(orig_direction: str) -> str:
@@ -1988,7 +2004,7 @@ def print_full():
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
     print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
     print(f"    🔄 ENTRY MODE: {_entry_mode_status()} | SL BAN: 30m")
-    print(f"    🕐 TIME ENGINE: HARD MAX 30m | LOSS -> FLIP | NO BAN")
+    print(f"    🕐 TIME ENGINE: HARD MAX 30m | LOSS -> ONE FLIP | NO BAN")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
