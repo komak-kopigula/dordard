@@ -759,6 +759,11 @@ _stats = {
 
 live_positions = {}
 cooldown_list = {}
+# Symbols whose exchange lot/min-notional rules cannot fit the configured margin ceiling.
+# They are skipped temporarily so the scanner moves on instead of retry-spamming them.
+_sizing_unavailable_until = {}
+_sizing_unavailable_reason = {}
+SIZING_SKIP_SECONDS = 300
 trade_log = []
 signal_weights = SignalWeights()
 scorer = SignalScorer(signal_weights)
@@ -1590,11 +1595,30 @@ def ks_upd(pnl):
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _sizing_is_blocked(sym):
+    now = time.time()
+    until = _sizing_unavailable_until.get(sym, 0.0)
+    return now < until
+
+
+def _mark_sizing_unavailable(sym, reason):
+    _sizing_unavailable_until[sym] = time.time() + SIZING_SKIP_SECONDS
+    _sizing_unavailable_reason[sym] = str(reason)
+
+
+def _sizing_skip_message(sym):
+    rem = max(0, _sizing_unavailable_until.get(sym, 0.0) - time.time())
+    reason = _sizing_unavailable_reason.get(sym, "margin/lot-size tidak cocok")
+    return f"{sym} dilewati {rem:.0f}s — {reason}"
+
+
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
     """Open a REAL position on Binance Futures DEMO and mirror the verified fill locally."""
     if not DEMO_TRADING:
         raise RuntimeError("DEMO_TRADING must remain True")
     if orig_direction not in ("LONG", "SHORT"):
+        return
+    if _sizing_is_blocked(sym):
         return
     execution_side = _get_execution_side(orig_direction)
     if _order_state_uncertain:
@@ -1618,10 +1642,13 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
         q_val = qty(sym, price)
         if q_val <= 0:
-            raise ValueError(
-                f"Quantity DEMO <= 0 setelah LOT_SIZE rounding untuk {sym}. "
-                f"ORDER_USDT={ORDER_USDT}, leverage={LEVERAGE}"
+            reason = (
+                f"lot/min-notional exchange tidak muat pada margin <= {DEMO_MAX_MARGIN_USDT:.2f} USDT "
+                f"dengan leverage {LEVERAGE}x"
             )
+            _mark_sizing_unavailable(sym, reason)
+            print(f"  ⏭️ [DEMO SKIP {sym}] {reason} — lanjut cari kandidat lain")
+            return
 
         response, account_pos, fill_price, actual_qty = _demo_market_open(
             sym, execution_side, q_val
@@ -1927,6 +1954,24 @@ def scan_one(sym):
 
         px_live = price_live(sym)
         if px_live == 0:
+            return None
+
+        # Sizing is a candidate filter: if this symbol cannot fit the configured
+        # margin after Binance lot/min-notional rules, skip it BEFORE it reaches
+        # live_open(). The scanner then naturally selects another valid coin.
+        if _sizing_is_blocked(sym):
+            return None
+        try:
+            q_candidate = qty(sym, px_live)
+        except Exception as e:
+            _mark_sizing_unavailable(sym, f"gagal membaca aturan quantity: {e}")
+            return None
+        if q_candidate <= 0:
+            reason = (
+                f"lot/min-notional exchange tidak muat pada margin <= {DEMO_MAX_MARGIN_USDT:.2f} USDT "
+                f"dengan leverage {LEVERAGE}x"
+            )
+            _mark_sizing_unavailable(sym, reason)
             return None
 
         btc_vetoed, btc_reason = btc_macro.check_veto(execution_side)
