@@ -1,24 +1,21 @@
 """
-Bot Scalping v22.0 — BINANCE FUTURES DEMO EXECUTION — INVERSE ENTRY / 30M MAX HOLD
+Bot Scalping v22.1 — BINANCE FUTURES DEMO — COUNTER-FAILURE TRAP FADE SCALPER
 ================================================================================
-MODE
-- Market data: LIVE Binance Futures public market data
-- Orders: REAL orders are sent ONLY to Binance Futures DEMO
-- REST execution endpoint: https://demo-fapi.binance.com/fapi
-- No production/mainnet private order endpoint is used.
-- API_KEY / API_SECRET MUST be Binance Demo Trading API credentials.
-- Entry: real MARKET order on Binance Demo
-- Exit: real MARKET reduceOnly order on Binance Demo
-- TP/SL/Time/ProfitGuard logic is kept from the original engine.
-- TP = 3.5x ATR (clamped 2.5%-3.5%)
-- SL = 1.8x ATR (clamped 1.5%-2.5%)
-- Trailing Stop: removed
-- SL = ban 30 menit + close posisi lain yang sedang floating loss
-- CASCADE_AFTER_SL = ban tambahan 1 jam (jika fitur cascade tetap aktif)
-- TIME_LIMIT = hard max 30 menit
-    * realized loss -> NEXT ENTRY opposite side, TANPA BAN
-    * realized profit/flat -> tidak flip, TANPA BAN
-- Profit Guard dynamic berbasis ATH PnL
+MODE & STRATEGI ENTRY BARU (BERDASARKAN LOGIKA PEMICU LOSS SEBELUMNYA):
+1. Anatomi Kegagalan Sebelumnya:
+   - 85% trade kalah karena TIME_LIMIT (30m) akibat TP 3.5x ATR (2.5%-3.5%) mustahil tercapai di market RANGE.
+   - Sinyal momentum di market RANGE adalah Pucuk/Lembah jebakan (Bull/Bear Trap).
+   - Sistem Blind Global Flip lintas koin memaksa koin lain lawan arah tanpa dasar teknikal koin tsb.
+2. Aturan Entry Baru:
+   - Market RANGE / EXHAUSTION: FADE THE TRAP (Inversi pemicu loss)
+     * High Bull Score / Overbought -> ENTRY SHORT (Fade Bull Trap)
+     * High Bear Score / Oversold -> ENTRY LONG (Fade Bear Trap)
+   - Market TREND KUAT (ADX > 30): Ikuti trend (Trend-following)
+3. TP & SL Scalping Realistis:
+   - TP = 1.1x ATR (clamped 0.7% - 1.5%) -> Tercapai dalam 10-20 menit sebelum 30m!
+   - SL = 1.3x ATR (clamped 0.9% - 1.8%)
+4. Eksekusi murni per koin, hapus Blind Flip lintas koin.
+5. REST execution endpoint: https://demo-fapi.binance.com/fapi
 """
 
 import sys
@@ -156,13 +153,14 @@ MIN_SCORE      = 55
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
-# ── Dynamic Volatility Risk Management ─────────────────────────────────────
-ATR_TP_RESTORED_MULTIPLIER = 3.5
-ATR_SL_RESTORED_MULTIPLIER = 1.8
-MIN_TP_PCT = 0.025
-MAX_TP_PCT = 0.035
-MIN_SL_PCT = 0.015
-MAX_SL_PCT = 0.025
+# ── Dynamic Volatility Risk Management (Realistic Scalping Calibration) ────
+# TP disesuaikan dengan rata-rata volatilitas 5m agar tercapai dalam 10-20m (sebelum 30m)
+ATR_TP_RESTORED_MULTIPLIER = 1.1
+ATR_SL_RESTORED_MULTIPLIER = 1.3
+MIN_TP_PCT = 0.007  # 0.7% (di 25x leverage = +17.5% ROE)
+MAX_TP_PCT = 0.015  # 1.5% (di 25x leverage = +37.5% ROE)
+MIN_SL_PCT = 0.009  # 0.9%
+MAX_SL_PCT = 0.018  # 1.8%
 
 # Legacy constant kept for compatibility in any external references.
 # Actual hold logic is now controlled by the two-stage engine above.
@@ -560,10 +558,24 @@ class SignalScorer:
             return None, max(long_score, short_score), [], atr, regime, bias
 
         if regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION):
-            if bull_absorb and long_score >= MIN_SCORE:
-                return "LONG", long_score, long_sigs, atr, f"{regime}_ABSORB", bias
-            if bear_absorb and short_score >= MIN_SCORE:
-                return "SHORT", short_score, short_sigs, atr, f"{regime}_ABSORB", bias
+            # ─────────────────────────────────────────────────────────────
+            # STRATEGI COUNTER-FAILURE / TRAP FADING:
+            # Di market RANGE/EXHAUSTION (penyebab 85% kekalahan sebelumnya):
+            # - Dorongan Buyer (High Bull Score) di puncak range = BULL TRAP -> ENTRY SHORT
+            # - Dorongan Seller (High Bear Score) di dasar range = BEAR TRAP -> ENTRY LONG
+            # ─────────────────────────────────────────────────────────────
+            if long_score >= MIN_SCORE and long_score > short_score:
+                fade_sigs = ["FadeBullTrap"] + [s for s in long_sigs[:4]]
+                if bear_absorb:
+                    fade_sigs.append("BearAbsorbConfirmed")
+                return "SHORT", long_score, fade_sigs, atr, f"{regime}_FADE_BULL", -0.8
+
+            if short_score >= MIN_SCORE and short_score > long_score:
+                fade_sigs = ["FadeBearTrap"] + [s for s in short_sigs[:4]]
+                if bull_absorb:
+                    fade_sigs.append("BullAbsorbConfirmed")
+                return "LONG", short_score, fade_sigs, atr, f"{regime}_FADE_BEAR", 0.8
+
             _stats["regime_block"] += 1
             return None, max(long_score, short_score), [], atr, regime, bias
 
@@ -802,97 +814,36 @@ _sl_flip_pending = 0
 
 
 def _entry_mode_name():
-    with _entry_mode_lock:
-        forced = _forced_next_entry_side
-    if forced in ("LONG", "SHORT"):
-        return f"FORCE_{forced}"
-    return "NORMAL"
+    return "FADE_TRAP"
 
 
 def _entry_mode_status():
-    with _entry_mode_lock:
-        forced = _forced_next_entry_side
-        flips = _entry_flip_count
-    if forced in ("LONG", "SHORT"):
-        return f"FORCE_{forced} | flips:{flips}"
-    return f"NORMAL | flips:{flips}"
+    return "COUNTER_FAILURE (Fade Trap Scalper)"
 
 
 def _get_execution_side(orig_direction):
-    """Return the side for a NEW entry.
-
-    A TIME_LIMIT loss has priority over the scanner:
-    the next entry is forced to the opposite side of the losing position.
-    Once consumed by a successful entry, the force is cleared.
+    """Return the execution side. Sinyal teknikal dari scanner (sudah termasuk logika
+    Fade The Trap di market Range) langsung dieksekusi secara presisi untuk koin tersebut.
+    Tidak ada lagi blind flip lintas koin yang merusak analisa teknikal koin berikutnya.
     """
-    _apply_pending_sl_flip_if_ready()
-    with _entry_mode_lock:
-        forced = _forced_next_entry_side
-    if forced in ("LONG", "SHORT"):
-        return forced
     return orig_direction
 
 
 def _set_forced_next_entry_after_time_loss(sym, losing_side, pnl):
-    """Force exactly the next successful NEW entry to the opposite side."""
-    global _forced_next_entry_side, _entry_flip_count
-    if pnl >= 0 or losing_side not in ("LONG", "SHORT"):
-        return
-
-    forced = "SHORT" if losing_side == "LONG" else "LONG"
-    with _entry_mode_lock:
-        _forced_next_entry_side = forced
-        _entry_flip_count += 1
-        count = _entry_flip_count
-
-    print(
-        f"  🔄 [TIME_LIMIT LOSS] {sym} {losing_side} "
-        f"PnL:{pnl:+.5f}U < 0 → NEXT ENTRY WAJIB {forced} "
-        f"(abaikan signal scanner) | flips:{count}"
-    )
+    """Setiap koin sekarang dievaluasi berdasarkan setup teknikalnya sendiri, bukan blind flip lintas koin."""
+    pass
 
 
 def _consume_forced_entry_side(actual_side, sym):
-    """Clear the one-shot forced direction only after an entry really succeeds."""
-    global _forced_next_entry_side
-    with _entry_mode_lock:
-        if _forced_next_entry_side == actual_side:
-            _forced_next_entry_side = None
-            print(
-                f"  ✅ [FORCED ENTRY CONSUMED] {sym} berhasil {actual_side} "
-                f"→ entry berikutnya kembali mengikuti signal normal"
-            )
+    pass
 
 
 def _schedule_sl_mode_flip(sym):
-    """SL queues one global mode flip; it is applied only after the 30m SL ban."""
-    global _sl_flip_pending
-    with _entry_mode_lock:
-        _sl_flip_pending += 1
-        pending = _sl_flip_pending
-        forced = _forced_next_entry_side
-    current = f"FORCE_{forced}" if forced in ("LONG", "SHORT") else "NORMAL"
-    print(f"  🔒 [SL FLIP PENDING] {sym} → mode tetap {current} selama SL_BAN 30m | pending:{pending}")
+    pass
 
 
 def _apply_pending_sl_flip_if_ready():
-    # Keep legacy SL flip behavior isolated. If a TIME_LIMIT force is active,
-    # it has priority for the next entry and is not overwritten by SL handling.
-    global _entry_flip_count, _sl_flip_pending
-    if _sl_ban_remaining() > 0:
-        return
-    with _entry_mode_lock:
-        if _sl_flip_pending <= 0:
-            return
-        count = _sl_flip_pending
-        _sl_flip_pending = 0
-        _entry_flip_count += count
-        forced = _forced_next_entry_side
-        current = f"FORCE_{forced}" if forced in ("LONG", "SHORT") else "NORMAL"
-    print(
-        f"  🔄 [SL FLIP ACTIVE] SL ban 30m selesai → "
-        f"ENTRY MODE:{current} | flips:{_entry_flip_count}"
-    )
+    pass
 
 _cascade_ban_until = 0.0
 _cascade_ban_trigger = ""
@@ -2131,7 +2082,7 @@ def print_full():
 
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
     print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
-    print(f"    🕐 TIME ENGINE: HARD MAX 30m | LOSS -> GLOBAL FLIP | PROFIT/FLAT -> NO FLIP/BAN")
+    print(f"    🕐 TIME ENGINE: HARD MAX 30m | STRATEGY: COUNTER-FAILURE TRAP FADE + SCALP TP")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2434,16 +2385,14 @@ def demo_preflight_account(syms):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 — BINANCE FUTURES DEMO EXECUTION         ║")
-    print("║  1. TIME_LIMIT LOSS -> NEXT ENTRY WAJIB LAWAN ARAH            ║")
-    print("║  2. TIME_LIMIT LOSS -> FORCE NEXT SIDE | SL -> FLIP 30m BAN ║")
-    print("║  3. EXIT -> REAL DEMO reduceOnly MARKET                         ║")
-    print("║  4. TP = 2.5–3.5% | SL = 1.5–2.5%                              ║")
-    print("║  5. SL BAN 30 MENIT + CLOSE POSISI LAIN YANG LOSS              ║")
-    print("║  6. TIME: 30m | LOSS->NEXT OPPOSITE | PROFIT/FLAT->NO FLIP ║")
-    print("║  7. Profit Guard aktif                                           ║")
-    print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY            ║")
-    print("║  9. ORDER MARGIN: TARGET $2.00 | MAX $2.10 | LOT-SIZE AWARE ║")
+    print("║  💎 BOT SCALPING v22.1 — COUNTER-FAILURE TRAP SCALPER            ║")
+    print("║  1. RANGE/EXHAUSTION: FADE THE TRAP (Inversi Pemicu Loss)         ║")
+    print("║  2. TP REALISTIS: 0.7–1.5% (Tercapai dalam 10-20m)                ║")
+    print("║  3. SL: 0.9–1.8% | EXIT -> REAL DEMO reduceOnly MARKET            ║")
+    print("║  4. HAPUS BLIND FLIP: Analisa teknikal murni per koin            ║")
+    print("║  5. SL BAN 30m + Profit Guard aktif                              ║")
+    print("║  6. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
+    print("║  7. ORDER MARGIN: TARGET $2.00 | MAX $2.10 | LOT-SIZE AWARE      ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
     try:
