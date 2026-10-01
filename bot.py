@@ -106,10 +106,10 @@ ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
 # ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
-SL_BAN_SECONDS = 30 * 60
-CASCADE_BAN_SECONDS = 0  # no extra entry ban; SL ban is exactly 30 minutes
+SL_BAN_SECONDS = 0  # SL tidak lagi memblokir entry (TANPA BAN)
+CASCADE_BAN_SECONDS = 0  # no extra entry ban
 TIME_LIMIT_BAN_SECONDS = 0  # deprecated: TIME_LIMIT tidak pernah membuat ban
-SL_LIQUIDATE_LOSERS = True
+SL_LIQUIDATE_LOSERS = False
 
 # ── PROFIT GUARD / ATH GIVEBACK PROTECTION ─────────────────────────────────
 PROFIT_GUARD_ENABLED = True
@@ -1512,13 +1512,16 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
     global _sl_ban_until, _sl_ban_reason, _sl_ban_trigger
     now = time.time()
     with _sl_ban_lock:
-        _sl_ban_until = max(_sl_ban_until, now + SL_BAN_SECONDS)
-        _sl_ban_reason = "SL"
-        _sl_ban_trigger = trigger_sym
-        _stats["sl_ban_count"] += 1
-        ban_until_local = _sl_ban_until
-
-    print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — DEMO entry dikunci 30 MENIT sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
+        if SL_BAN_SECONDS > 0:
+            _sl_ban_until = max(_sl_ban_until, now + SL_BAN_SECONDS)
+            _sl_ban_reason = "SL"
+            _sl_ban_trigger = trigger_sym
+            _stats["sl_ban_count"] += 1
+            ban_until_local = _sl_ban_until
+            print(f"\n  🛑 [SL CIRCUIT BAN] {trigger_sym} kena SL — DEMO entry dikunci sampai {time.strftime('%H:%M:%S', time.localtime(ban_until_local))}")
+        else:
+            _stats["sl_ban_count"] += 1
+            print(f"\n  ℹ️ [SL HIT] {trigger_sym} kena SL — TANPA BAN (Entry baru tetap aktif)")
     _schedule_sl_mode_flip(trigger_sym)
     if SL_LIQUIDATE_LOSERS:
         _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
@@ -2390,7 +2393,7 @@ def run_bot():
     print("║  2. TP REALISTIS: 0.7–1.5% (Tercapai dalam 10-20m)                ║")
     print("║  3. SL: 0.9–1.8% | EXIT -> REAL DEMO reduceOnly MARKET            ║")
     print("║  4. HAPUS BLIND FLIP: Analisa teknikal murni per koin            ║")
-    print("║  5. SL BAN 30m + Profit Guard aktif                              ║")
+    print("║  5. TANPA SL BAN (Entry langsung lanjut) + Profit Guard aktif     ║")
     print("║  6. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
     print("║  7. ORDER MARGIN: TARGET $2.00 | MAX $2.10 | LOT-SIZE AWARE      ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
