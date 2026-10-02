@@ -1,5 +1,5 @@
 """
-Bot Scalping v23.0 — BINANCE FUTURES DEMO — DYNAMIC INVERSION STATE ENGINE
+Bot Scalping v24.0 — BINANCE FUTURES DEMO — LOSS TOGGLE STATE ENGINE
 ================================================================================
 ATURAN ENTRY & STATE MACHINE STRATEGI:
 1. Entry Awal (Mode NORMAL):
@@ -15,8 +15,9 @@ ATURAN ENTRY & STATE MACHINE STRATEGI:
    - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif).
 4. Konfigurasi:
    - MAX_POSITIONS = 1
-   - MARGIN = $3.00 USDT per posisi (ORDER_USDT = 3.0)
-   - TANPA BAN: Tidak ada ban SL, tidak ada ban cascade, tidak ada ban profit guard.
+   - MARGIN TARGET = $3.00 USDT per posisi (ceiling $3.10 setelah rounding exchange)
+   - TANPA BAN: tidak ada SL ban, cascade ban, time-limit ban, cooldown, atau profit-guard ban.
+   - TIDAK ADA SIGNAL FLIP EXIT; hanya state toggle setelah loss.
    - REST execution endpoint: https://demo-fapi.binance.com/fapi
 """
 
@@ -140,7 +141,7 @@ MONITOR_INT   = 0.1
 BATCH_SIZE    = 15
 MAX_WORKERS   = 5
 SLOT_FILL_INT = 0.01
-COOLDOWN_SEC  = 300
+COOLDOWN_SEC  = 0          # TIDAK ADA cooldown/ban antar-trade
 
 # ── REST API SAFETY / ANTI-403 ──────────────────────────────────────────────
 REST_MIN_INTERVAL = 0.20
@@ -150,18 +151,26 @@ REST_418_COOLDOWN = 900.0
 REST_RETRIES = 2
 
 # ── Scoring & Filter ────────────────────────────────────────────────────────
-MIN_SCORE      = 55
+MIN_SCORE      = 65       # Naikkan kualitas kandidat; lebih selektif
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
+# Saat MODE=INVERTED, arah tetap WAJIB dibalik sesuai state machine.
+# Gate ini hanya memastikan arah lawan punya bukti reversal/minor confirmation,
+# sehingga bot tidak asal counter-trend setelah satu loss.
+INVERTED_MIN_EXEC_SCORE = 35
+INVERTED_MIN_CONFIRMATIONS = 2
+
 # ── Dynamic Volatility Risk Management (Realistic Scalping Calibration) ────
-# TP disesuaikan dengan rata-rata volatilitas 5m agar tercapai dalam 10-20m (sebelum 30m)
-ATR_TP_RESTORED_MULTIPLIER = 1.1
-ATR_SL_RESTORED_MULTIPLIER = 1.3
-MIN_TP_PCT = 0.007  # 0.7% (di 25x leverage = +17.5% ROE)
-MAX_TP_PCT = 0.015  # 1.5% (di 25x leverage = +37.5% ROE)
-MIN_SL_PCT = 0.009  # 0.9%
-MAX_SL_PCT = 0.018  # 1.8%
+# Risk/reward diperbaiki: TP dibuat lebih besar daripada SL.
+# Tujuannya menurunkan break-even win-rate setelah fee, tanpa mengubah
+# aturan 30 menit dan tanpa menambah trailing/signal-flip.
+ATR_TP_RESTORED_MULTIPLIER = 1.35
+ATR_SL_RESTORED_MULTIPLIER = 0.85
+MIN_TP_PCT = 0.010   # 1.0%
+MAX_TP_PCT = 0.020   # 2.0%
+MIN_SL_PCT = 0.0065  # 0.65%
+MAX_SL_PCT = 0.012   # 1.20%
 
 # Legacy constant kept for compatibility in any external references.
 # Actual hold logic is now controlled by the two-stage engine above.
@@ -182,9 +191,10 @@ BTC_WINDOW_SEC       = 8.0
 BTC_BREAKER_COOLDOWN = 120.0
 
 # ── Kill Switch ─────────────────────────────────────────────────────────────
-DAILY_LOSS   = -20.0
-CONSEC_MAX   = 15
-CONSEC_PAUSE = 10
+# Safety counters tetap dicatat untuk statistik, tetapi TIDAK menjadi ban.
+DAILY_LOSS   = -1_000_000.0
+CONSEC_MAX   = 1_000_000
+CONSEC_PAUSE = 0
 
 # ── Learning ────────────────────────────────────────────────────────────────
 LEARNING_WINDOW       = 200
@@ -836,46 +846,46 @@ def _get_execution_side(orig_direction):
 
 
 def _handle_strategy_outcome(reason, pnl, sym):
-    """Logika perubahan mode berdasarkan hasil trade:
-    - Kena SL atau TIME_LIMIT dengan minus (< 0):
-      Logika DIBALIK (toggle: NORMAL <-> INVERTED)
-    - Kena TP atau TIME_LIMIT dengan profit (>= 0):
-      Logika TIDAK BERUBAH
+    """Global entry-mode state machine.
+
+    NORMAL:
+        analysis LONG  -> LONG
+        analysis SHORT -> SHORT
+
+    INVERTED:
+        analysis LONG  -> SHORT
+        analysis SHORT -> LONG
+
+    ONLY these events toggle the mode:
+      - SL
+      - TIME_LIMIT with realized PnL < 0
+
+    TP and TIME_LIMIT with realized PnL >= 0 preserve the current mode.
     """
     global _strategy_mode, _flip_count
-    is_loss = (pnl < 0) or (reason == "SL") or (reason == "TIME_LIMIT" and pnl < 0)
+
+    is_sl_loss = (reason == "SL")
+    is_time_loss = (reason == "TIME_LIMIT" and pnl < -1e-9)
+    is_loss = is_sl_loss or is_time_loss
 
     with _entry_mode_lock:
         old_mode = _strategy_mode
+
         if is_loss:
             _strategy_mode = "INVERTED" if old_mode == "NORMAL" else "NORMAL"
             _flip_count += 1
             new_mode = _strategy_mode
             print(
-                f"\n  🔄 [LOGIKA TERBALIK/TOGGLE] {sym} LOSS ({reason} PnL:{pnl:+.5f}U < 0) "
-                f"→ Mode berubah: {old_mode} ➔ {new_mode} | Total Flip: {_flip_count}"
+                f"\n  🔄 [LOSS TOGGLE] {sym} {reason} PnL:{pnl:+.5f}U "
+                f"→ {old_mode} ➔ {new_mode} | Flip #{_flip_count}"
             )
         else:
             print(
-                f"\n  ✅ [LOGIKA DIPERTAHANKAN] {sym} PROFIT ({reason} PnL:{pnl:+.5f}U >= 0) "
-                f"→ Mode tetap: {old_mode} | Total Flip: {_flip_count}"
+                f"\n  ✅ [MODE KEEP] {sym} {reason} PnL:{pnl:+.5f}U "
+                f"→ Mode tetap {old_mode}"
             )
 
 
-def _set_forced_next_entry_after_time_loss(sym, losing_side, pnl):
-    pass
-
-
-def _consume_forced_entry_side(actual_side, sym):
-    pass
-
-
-def _schedule_sl_mode_flip(sym):
-    pass
-
-
-def _apply_pending_sl_flip_if_ready():
-    pass
 
 _cascade_ban_until = 0.0
 _cascade_ban_trigger = ""
@@ -1007,11 +1017,12 @@ def _get_symbol_rules(symbol):
 
 
 # Binance Futures DEMO minimum-notional is read from exchangeInfo per symbol.
-# Do NOT hard-code 50 USDT: that can make valid low-priced/large-tick symbols
-# impossible to enter with ORDER_USDT ~= 2.0 at 25x.
-DEMO_MAX_MARGIN_USDT = 3.20
-DEMO_MIN_MARGIN_USDT = 2.80
-DEMO_TARGET_MARGIN_USDT = 3.00
+# Target exactly $3.00 margin; allow only a small $0.10 rounding tolerance.
+# If a symbol's exchange lot/min-notional rules require more than this ceiling,
+# the symbol is skipped and the scanner continues to another candidate.
+DEMO_TARGET_MARGIN_USDT = ORDER_USDT
+DEMO_MIN_MARGIN_USDT = 2.90
+DEMO_MAX_MARGIN_USDT = 3.10
 DEMO_NOTIONAL_BUFFER_USDT = 0.05
 
 
@@ -1053,13 +1064,13 @@ def _round_qty_up(q, step, precision):
 
 
 def qty(symbol, price):
-    """Build the smallest valid quantity near $2 margin, capped at $2.10.
+    """Build the smallest valid quantity near $3 margin with a $3.10 ceiling.
 
     Priority:
       1. satisfy symbol LOT_SIZE/MARKET_LOT_SIZE;
       2. satisfy symbol MIN_NOTIONAL/NOTIONAL if present;
-      3. target ~2.00 USDT margin at current leverage;
-      4. never silently exceed 2.10 USDT initial margin.
+      3. target ORDER_USDT (= $3.00) at current leverage;
+      4. never silently exceed DEMO_MAX_MARGIN_USDT (= $3.10) initial margin.
     """
     if price <= 0:
         return 0.0
@@ -1071,10 +1082,10 @@ def qty(symbol, price):
     precision = rules["precision"]
     min_notional = rules["min_notional"]
 
-    target_notional = DEMO_TARGET_MARGIN_USDT * LEVERAGE
+    target_notional = ORDER_USDT * LEVERAGE
     max_notional = DEMO_MAX_MARGIN_USDT * LEVERAGE
 
-    # Use the exchange's actual minimum, not an artificial 50 USDT floor.
+    # Use the exchange's actual minimum, but never exceed the margin ceiling.
     required_notional = max(target_notional, min_notional + DEMO_NOTIONAL_BUFFER_USDT)
     raw = required_notional / price
     q_val = _round_qty_up(raw, step, precision)
@@ -1543,7 +1554,6 @@ def _activate_sl_ban_and_liquidate(trigger_sym):
         else:
             _stats["sl_ban_count"] += 1
             print(f"\n  ℹ️ [SL HIT] {trigger_sym} kena SL — TANPA BAN (Entry baru tetap aktif)")
-    _schedule_sl_mode_flip(trigger_sym)
     if SL_LIQUIDATE_LOSERS:
         _liquidate_losing_positions("CASCADE_AFTER_SL", exclude={trigger_sym})
 
@@ -1588,26 +1598,14 @@ def _maybe_activate_profit_guard():
 
 
 def ks_check():
-    k, now = _ks, time.time()
-    _apply_pending_sl_flip_if_ready()
-    circuit, remaining = _circuit_snapshot()
-    if remaining > 0:
-        return True, circuit
+    """No SL/time/cascade/profit/consecutive-loss entry bans.
+
+    The only condition that may stop new entries is an uncertain exchange
+    order state, because entering again while an order outcome is unknown
+    could create an unintended duplicate position.
+    """
     if _order_state_uncertain:
         return True, "ORDER_STATE_UNKNOWN — paper engine dihentikan sementara"
-    if k["active"] and now >= k["resume"]:
-        k["active"], k["consec"] = False, 0
-    if k["active"]:
-        return True, k["reason"]
-    day = now - (now % 86400)
-    if day > k["day_reset"]:
-        k["daily"], k["day_reset"] = 0.0, day
-    if k["daily"] <= DAILY_LOSS:
-        k["active"], k["reason"], k["resume"] = True, f"daily({k['daily']:.2f})", day + 86400
-        return True, k["reason"]
-    if k["consec"] >= CONSEC_MAX:
-        k["active"], k["reason"], k["resume"] = True, f"consec({k['consec']})", now + CONSEC_PAUSE
-        return True, k["reason"]
     return False, ""
 
 
@@ -1715,14 +1713,10 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock:
             live_positions[sym] = pos
 
-        # Consume the forced direction ONLY after Binance DEMO entry is
-        # successfully verified and mirrored locally.
-        _consume_forced_entry_side(execution_side, sym)
-
         margin_used = (actual_qty * fill_price) / LEVERAGE
         print(
             f"\n  🚀 [DEMO REAL ENTRY] {sym} ANALISA:{orig_direction} -> EKSEKUSI:{execution_side} "
-            f"| LOGIKA:{_entry_mode_name()} (Flips:{_flip_count}) @ {fill_price:.8g} "
+            f"| MODE:{_entry_mode_name()} (Flips:{_flip_count}) @ {fill_price:.8g} "
             f"| qty:{actual_qty:.8g} | margin:~${margin_used:.2f} | leverage:{LEVERAGE}x "
             f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
         )
@@ -1877,8 +1871,6 @@ def live_close(sym, reason, price=None):
     # - Kena TP atau TIME_LIMIT dengan profit -> Mode TETAP (dipertahankan)
     _handle_strategy_outcome(reason, pnl, sym)
 
-    with _lock:
-        cooldown_list[sym] = time.time() + COOLDOWN_SEC
     _hot_syms.appendleft(sym)
     _rescan_q.put(1)
     print_inline()
@@ -1957,6 +1949,65 @@ def monitor_positions():
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _inverted_quality_gate(df: pd.DataFrame, sym: str, execution_side: str) -> Tuple[bool, int, int]:
+    """Quality gate for INVERTED mode.
+
+    It never changes the required opposite direction. It only rejects an
+    inverted entry when the execution side has too little supporting evidence.
+    """
+    try:
+        row = df.iloc[-2]
+        prev = df.iloc[-3]
+
+        if execution_side == "LONG":
+            exec_score, _ = scorer._score_long(df, sym)
+            bull_abs, _, _ = AbsorptionDetector.detect(df)
+            confirmations = 0
+
+            if row["rsi"] <= 45:
+                confirmations += 1
+            if row["mh"] > prev["mh"]:
+                confirmations += 1
+            if row.get("delta_ratio", 0.0) > 0.08 or row.get("br", 0.5) > 0.54:
+                confirmations += 1
+            if bull_abs:
+                confirmations += 1
+            if order_book.get_imbalance(sym) > 0.10:
+                confirmations += 1
+            if row["close"] > row["e5"]:
+                confirmations += 1
+
+        elif execution_side == "SHORT":
+            exec_score, _ = scorer._score_short(df, sym)
+            _, bear_abs, _ = AbsorptionDetector.detect(df)
+            confirmations = 0
+
+            if row["rsi"] >= 55:
+                confirmations += 1
+            if row["mh"] < prev["mh"]:
+                confirmations += 1
+            if row.get("delta_ratio", 0.0) < -0.08 or row.get("br", 0.5) < 0.46:
+                confirmations += 1
+            if bear_abs:
+                confirmations += 1
+            if order_book.get_imbalance(sym) < -0.10:
+                confirmations += 1
+            if row["close"] < row["e5"]:
+                confirmations += 1
+
+        else:
+            return False, 0, 0
+
+        ok = (
+            exec_score >= INVERTED_MIN_EXEC_SCORE
+            and confirmations >= INVERTED_MIN_CONFIRMATIONS
+        )
+        return ok, int(exec_score), int(confirmations)
+
+    except Exception:
+        return False, 0, 0
+
+
 def scan_one(sym):
     try:
         time.sleep(0.002)
@@ -1973,12 +2024,25 @@ def scan_one(sym):
             return None
         if orig_direction not in ("LONG", "SHORT"):
             return None
-        # Global mode menentukan arah order; posisi yang sudah terbuka tidak disentuh.
+        # Global state menentukan arah EKSEKUSI; analisa tetap berasal dari
+        # scorer normal. Posisi yang sudah terbuka tidak disentuh.
         execution_side = _get_execution_side(orig_direction)
 
         px_live = price_live(sym)
         if px_live == 0:
             return None
+
+        # Hindari entry terlalu jauh dari candle yang menjadi dasar analisa.
+        candle_gap = abs(px_live - px_candle) / px_candle if px_candle > 0 else 1.0
+        if candle_gap > 0.0035:
+            return None
+
+        # Dalam INVERTED mode, arah tetap dibalik, tetapi entry lawan
+        # membutuhkan konfirmasi reversal agar tidak asal counter-trend.
+        if _entry_mode_name() == "INVERTED":
+            inv_ok, _, _ = _inverted_quality_gate(df_ta, sym, execution_side)
+            if not inv_ok:
+                return None
 
         # Sizing is a candidate filter: if this symbol cannot fit the configured
         # margin after Binance lot/min-notional rules, skip it BEFORE it reaches
@@ -2078,7 +2142,7 @@ def print_full():
     print(f"    🔔 INSTITUTIONAL SCALPING v22 DEMO — LIVE MARKET DATA")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | Grace:{_stats['time_grace_entries']} | GraceDrawdown:{_stats['time_grace_exits']}")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimitLoss:{_stats['time_grace_exits']}")
 
     circuit, _ = _circuit_snapshot()
     if _stats["ath_pnl"] >= PROFIT_GUARD_ARM_PNL:
@@ -2097,9 +2161,9 @@ def print_full():
     else:
         guard_info = ""
 
-    print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
-    print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
-    print(f"    🕐 STRATEGY ENGINE: MODE=[{_strategy_mode}] (Flips:{_flip_count}) | MAX 1 POS | MARGIN: $3.00 | NO BANS")
+    print("    🛑 BANS: OFF | SL-BAN:0 | CASCADE-BAN:0 | TIME-BAN:0 | PROFIT-GUARD-BAN:0")
+    print(f"    🧱 ProfitGuard:DISABLED | Cascade Close:DISABLED | ATH{guard_info}")
+    print(f"    🕐 STRATEGY ENGINE: MODE=[{_strategy_mode}] (Flips:{_flip_count}) | MAX 1 POS | MARGIN: $3.00 | NO BANS | NO SIGNAL FLIP")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2402,15 +2466,13 @@ def demo_preflight_account(syms):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v23.0 — DYNAMIC INVERSION STATE ENGINE          ║")
-    print("║  1. START MODE: NORMAL (Analisa LONG -> LONG, SHORT -> SHORT)     ║")
-    print("║  2. LOSS TRIGGER (SL / MINUS TIME_LIMIT): TOGGLE KEBALIKAN        ║")
-    print("║     * Dari NORMAL -> Jadi INVERTED (LONG -> SHORT, SHORT -> LONG) ║")
-    print("║     * Dari INVERTED -> Jadi NORMAL kembali                        ║")
-    print("║  3. PROFIT TRIGGER: PERTAHANKAN MODE SAAT INI (TIDAK BERUBAH)     ║")
-    print("║  4. POSISI: TETAP MAKSIMAL 1 POSISI                              ║")
-    print("║  5. MARGIN: $3.00 USDT PER POSISI (LEVERAGE 25x)                 ║")
-    print("║  6. BEBAS BAN: TIDAK ADA BAN (Entry langsung jalan terus)        ║")
+    print("║  💎 BOT SCALPING v24.0 — LOSS TOGGLE STATE ENGINE                ║")
+    print("║  1. START: NORMAL (Analisa LONG->LONG | SHORT->SHORT)             ║")
+    print("║  2. SL / TIME_LIMIT MINUS: TOGGLE NORMAL <-> INVERTED            ║")
+    print("║  3. TP / TIME_LIMIT PROFIT: MODE TETAP                            ║")
+    print("║  4. MAX POSISI: 1                                                 ║")
+    print("║  5. TARGET MARGIN: $3.00 USDT | CEILING: $3.10                   ║")
+    print("║  6. TANPA BAN / TANPA SIGNAL FLIP                                 ║")
     print("║  7. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
