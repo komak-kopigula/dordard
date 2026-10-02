@@ -1,21 +1,23 @@
 """
-Bot Scalping v22.1 — BINANCE FUTURES DEMO — COUNTER-FAILURE TRAP FADE SCALPER
+Bot Scalping v23.0 — BINANCE FUTURES DEMO — DYNAMIC INVERSION STATE ENGINE
 ================================================================================
-MODE & STRATEGI ENTRY BARU (BERDASARKAN LOGIKA PEMICU LOSS SEBELUMNYA):
-1. Anatomi Kegagalan Sebelumnya:
-   - 85% trade kalah karena TIME_LIMIT (30m) akibat TP 3.5x ATR (2.5%-3.5%) mustahil tercapai di market RANGE.
-   - Sinyal momentum di market RANGE adalah Pucuk/Lembah jebakan (Bull/Bear Trap).
-   - Sistem Blind Global Flip lintas koin memaksa koin lain lawan arah tanpa dasar teknikal koin tsb.
-2. Aturan Entry Baru:
-   - Market RANGE / EXHAUSTION: FADE THE TRAP (Inversi pemicu loss)
-     * High Bull Score / Overbought -> ENTRY SHORT (Fade Bull Trap)
-     * High Bear Score / Oversold -> ENTRY LONG (Fade Bear Trap)
-   - Market TREND KUAT (ADX > 30): Ikuti trend (Trend-following)
-3. TP & SL Scalping Realistis:
-   - TP = 1.1x ATR (clamped 0.7% - 1.5%) -> Tercapai dalam 10-20 menit sebelum 30m!
-   - SL = 1.3x ATR (clamped 0.9% - 1.8%)
-4. Eksekusi murni per koin, hapus Blind Flip lintas koin.
-5. REST execution endpoint: https://demo-fapi.binance.com/fapi
+ATURAN ENTRY & STATE MACHINE STRATEGI:
+1. Entry Awal (Mode NORMAL):
+   - Menganalisa sinyal teknikal (EMA, MACD, Volume Delta, RSI, Absorption).
+   - Analisa LONG  -> Buka posisi LONG.
+   - Analisa SHORT -> Buka posisi SHORT.
+2. Kondisi Loss (Kena SL atau Kena TIME_LIMIT dengan minus):
+   - Logika bot DIBALIK (Toggle State):
+     * Dari NORMAL berubah jadi INVERTED (analisa LONG jadi SHORT, SHORT jadi LONG).
+     * Dari INVERTED berubah kembali jadi NORMAL (analisa LONG jadi LONG, SHORT jadi SHORT).
+     * Terus berganti setiap kali mengalami loss.
+3. Kondisi Profit (Kena TP atau Kena TIME_LIMIT dengan profit):
+   - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif).
+4. Konfigurasi:
+   - MAX_POSITIONS = 1
+   - MARGIN = $3.00 USDT per posisi (ORDER_USDT = 3.0)
+   - TANPA BAN: Tidak ada ban SL, tidak ada ban cascade, tidak ada ban profit guard.
+   - REST execution endpoint: https://demo-fapi.binance.com/fapi
 """
 
 import sys
@@ -105,28 +107,27 @@ LEVERAGE      = 25
 ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
-# ── LOSS CIRCUIT / LOSS LIQUIDATION ────────────────────────────────────────
-SL_BAN_SECONDS = 0  # SL tidak lagi memblokir entry (TANPA BAN)
-CASCADE_BAN_SECONDS = 0  # no extra entry ban
-TIME_LIMIT_BAN_SECONDS = 0  # deprecated: TIME_LIMIT tidak pernah membuat ban
+# ── LOSS CIRCUIT / NO ENTRY BANS ───────────────────────────────────────────
+SL_BAN_SECONDS = 0          # TANPA BAN saat SL
+CASCADE_BAN_SECONDS = 0     # TANPA BAN cascade
+TIME_LIMIT_BAN_SECONDS = 0  # TANPA BAN time limit
 SL_LIQUIDATE_LOSERS = False
 
 # ── PROFIT GUARD / ATH GIVEBACK PROTECTION ─────────────────────────────────
-PROFIT_GUARD_ENABLED = True
+PROFIT_GUARD_ENABLED = False  # Dinonaktifkan: tidak ada ban profit guard
 PROFIT_GUARD_ARM_PNL = 1.50
 PROFIT_GUARD_GIVEBACK_PCT_LOW = 0.40
 PROFIT_GUARD_GIVEBACK_PCT_MID = 0.35
 PROFIT_GUARD_GIVEBACK_PCT_HIGH = 0.30
 PROFIT_GUARD_GIVEBACK_PCT_MAX = 0.20
 PROFIT_GUARD_GIVEBACK_MIN = 0.50
-PROFIT_GUARD_BAN_SECONDS = 2 * 60 * 60
-PROFIT_GUARD_CLOSE_LOSERS = True
+PROFIT_GUARD_BAN_SECONDS = 0
+PROFIT_GUARD_CLOSE_LOSERS = False
 
 # ── HARD 30-MINUTE TIME LIMIT ──────────────────────────────────────────────
 # Semua posisi wajib ditutup maksimal pada menit ke-30.
-# - Floating loss pada menit ke-30 -> TIME_LIMIT + FLIP MODE
-# - Floating profit/flat pada menit ke-30 -> TIME_LIMIT, TANPA FLIP/BAN
-# - TP / SL / exit lain sebelum 30m -> tidak menambah TIME_BAN
+# - Floating loss pada menit ke-30 -> TIME_LIMIT exit -> Toggle Inversion Mode
+# - Floating profit/flat pada menit ke-30 -> TIME_LIMIT exit -> Pertahankan Mode
 TIME_LIMIT_STAGE1_SECONDS = 30 * 60
 TIME_LIMIT_GRACE_SECONDS = 0
 MAX_TOTAL_HOLD_SECONDS = TIME_LIMIT_STAGE1_SECONDS
@@ -558,24 +559,15 @@ class SignalScorer:
             return None, max(long_score, short_score), [], atr, regime, bias
 
         if regime in (MarketRegime.REGIME_RANGE, MarketRegime.REGIME_EXHAUSTION):
-            # ─────────────────────────────────────────────────────────────
-            # STRATEGI COUNTER-FAILURE / TRAP FADING:
-            # Di market RANGE/EXHAUSTION (penyebab 85% kekalahan sebelumnya):
-            # - Dorongan Buyer (High Bull Score) di puncak range = BULL TRAP -> ENTRY SHORT
-            # - Dorongan Seller (High Bear Score) di dasar range = BEAR TRAP -> ENTRY LONG
-            # ─────────────────────────────────────────────────────────────
+            # Analisa teknikal normal bot pada kondisi Range / Exhaustion:
             if long_score >= MIN_SCORE and long_score > short_score:
-                fade_sigs = ["FadeBullTrap"] + [s for s in long_sigs[:4]]
-                if bear_absorb:
-                    fade_sigs.append("BearAbsorbConfirmed")
-                return "SHORT", long_score, fade_sigs, atr, f"{regime}_FADE_BULL", -0.8
-
+                return "LONG", long_score, long_sigs, atr, regime, bias
             if short_score >= MIN_SCORE and short_score > long_score:
-                fade_sigs = ["FadeBearTrap"] + [s for s in short_sigs[:4]]
-                if bull_absorb:
-                    fade_sigs.append("BullAbsorbConfirmed")
-                return "LONG", short_score, fade_sigs, atr, f"{regime}_FADE_BEAR", 0.8
-
+                return "SHORT", short_score, short_sigs, atr, regime, bias
+            if bull_absorb and long_score >= MIN_SCORE - 10:
+                return "LONG", long_score, long_sigs + ["BullAbsorb"], atr, f"{regime}_ABSORB", bias
+            if bear_absorb and short_score >= MIN_SCORE - 10:
+                return "SHORT", short_score, short_sigs + ["BearAbsorb"], atr, f"{regime}_ABSORB", bias
             _stats["regime_block"] += 1
             return None, max(long_score, short_score), [], atr, regime, bias
 
@@ -805,32 +797,72 @@ _sl_ban_trigger = ""
 #   SHORT -> TIME_LIMIT loss -> next entry MUST be LONG
 #
 # After that forced entry is successfully opened, the force is consumed and
-# subsequent entries follow the normal strategy signal again (unless another
-# loss creates a new forced direction).
+# ── DYNAMIC INVERSION STATE ENGINE ─────────────────────────────────────────
+# State Machine:
+# 1. Start: NORMAL mode (LONG -> LONG, SHORT -> SHORT)
+# 2. Ketika posisi LOSS (kena SL atau TIME_LIMIT dengan minus):
+#    Mode DIBALIK (Toggle):
+#    * Dari NORMAL -> Jadi INVERTED (LONG -> SHORT, SHORT -> LONG)
+#    * Dari INVERTED -> Jadi NORMAL kembali (LONG -> LONG, SHORT -> SHORT)
+# 3. Ketika posisi PROFIT (kena TP atau TIME_LIMIT dengan profit):
+#    Mode TIDAK BERUBAH (tetap mempertahankan mode yang sedang aktif).
+# 4. Tanpa blind signal flip lintas koin acak; analisa sinyal tetap dilakukan
+#    secara menyeluruh, lalu arahnya disesuaikan dengan status mode state machine.
 _entry_mode_lock = threading.Lock()
-_forced_next_entry_side = None
-_entry_flip_count = 0
-_sl_flip_pending = 0
+_strategy_mode = "NORMAL"  # Starts in NORMAL mode
+_flip_count = 0
 
 
 def _entry_mode_name():
-    return "FADE_TRAP"
+    with _entry_mode_lock:
+        return _strategy_mode
 
 
 def _entry_mode_status():
-    return "COUNTER_FAILURE (Fade Trap Scalper)"
+    with _entry_mode_lock:
+        return f"{_strategy_mode} (Flips:{_flip_count})"
 
 
 def _get_execution_side(orig_direction):
-    """Return the execution side. Sinyal teknikal dari scanner (sudah termasuk logika
-    Fade The Trap di market Range) langsung dieksekusi secara presisi untuk koin tersebut.
-    Tidak ada lagi blind flip lintas koin yang merusak analisa teknikal koin berikutnya.
+    """Return the execution side according to the current strategy mode.
+    - NORMAL: analisa bot LONG -> LONG, analisa bot SHORT -> SHORT
+    - INVERTED: analisa bot LONG -> SHORT, analisa bot SHORT -> LONG
     """
+    with _entry_mode_lock:
+        mode = _strategy_mode
+    if mode == "INVERTED":
+        return "SHORT" if orig_direction == "LONG" else "LONG"
     return orig_direction
 
 
+def _handle_strategy_outcome(reason, pnl, sym):
+    """Logika perubahan mode berdasarkan hasil trade:
+    - Kena SL atau TIME_LIMIT dengan minus (< 0):
+      Logika DIBALIK (toggle: NORMAL <-> INVERTED)
+    - Kena TP atau TIME_LIMIT dengan profit (>= 0):
+      Logika TIDAK BERUBAH
+    """
+    global _strategy_mode, _flip_count
+    is_loss = (pnl < 0) or (reason == "SL") or (reason == "TIME_LIMIT" and pnl < 0)
+
+    with _entry_mode_lock:
+        old_mode = _strategy_mode
+        if is_loss:
+            _strategy_mode = "INVERTED" if old_mode == "NORMAL" else "NORMAL"
+            _flip_count += 1
+            new_mode = _strategy_mode
+            print(
+                f"\n  🔄 [LOGIKA TERBALIK/TOGGLE] {sym} LOSS ({reason} PnL:{pnl:+.5f}U < 0) "
+                f"→ Mode berubah: {old_mode} ➔ {new_mode} | Total Flip: {_flip_count}"
+            )
+        else:
+            print(
+                f"\n  ✅ [LOGIKA DIPERTAHANKAN] {sym} PROFIT ({reason} PnL:{pnl:+.5f}U >= 0) "
+                f"→ Mode tetap: {old_mode} | Total Flip: {_flip_count}"
+            )
+
+
 def _set_forced_next_entry_after_time_loss(sym, losing_side, pnl):
-    """Setiap koin sekarang dievaluasi berdasarkan setup teknikalnya sendiri, bukan blind flip lintas koin."""
     pass
 
 
@@ -977,9 +1009,9 @@ def _get_symbol_rules(symbol):
 # Binance Futures DEMO minimum-notional is read from exchangeInfo per symbol.
 # Do NOT hard-code 50 USDT: that can make valid low-priced/large-tick symbols
 # impossible to enter with ORDER_USDT ~= 2.0 at 25x.
-DEMO_MAX_MARGIN_USDT = 2.10
-DEMO_MIN_MARGIN_USDT = 1.90
-DEMO_TARGET_MARGIN_USDT = 2.00
+DEMO_MAX_MARGIN_USDT = 3.20
+DEMO_MIN_MARGIN_USDT = 2.80
+DEMO_TARGET_MARGIN_USDT = 3.00
 DEMO_NOTIONAL_BUFFER_USDT = 0.05
 
 
@@ -1399,23 +1431,12 @@ def _sl_ban_remaining():
 
 
 def _circuit_snapshot():
-    now = time.time()
-    with _sl_ban_lock:
-        items = [
-            ("SL_BAN", max(0.0, _sl_ban_until - now)),
-            ("CASCADE_BAN", max(0.0, _cascade_ban_until - now)),
-            ("PROFIT_GUARD", max(0.0, _profit_guard_until - now)),
-        ]
-    active = [(name, rem) for name, rem in items if rem > 0]
-    if not active:
-        return "", 0.0
-    name, rem = max(active, key=lambda x: x[1])
-    return _fmt_ban(name, rem), rem
+    # User requirement: tidak ada ban posisi lagi
+    return "", 0.0
 
 
 def _sl_ban_status():
-    rem = _sl_ban_remaining()
-    return _fmt_ban("SL_BAN", rem)
+    return ""
 
 
 def _activate_aux_ban(kind: str, seconds: float, trigger_sym: str):
@@ -1698,9 +1719,11 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         # successfully verified and mirrored locally.
         _consume_forced_entry_side(execution_side, sym)
 
+        margin_used = (actual_qty * fill_price) / LEVERAGE
         print(
-            f"\n  🚀 [DEMO REAL ENTRY] {sym} SIGNAL:{orig_direction} -> ENTRY:{execution_side} | MODE:{_entry_mode_name()} | flips:{_entry_flip_count} @ {fill_price:.8g} "
-            f"| qty:{actual_qty:.8g} | leverage:{LEVERAGE}x "
+            f"\n  🚀 [DEMO REAL ENTRY] {sym} ANALISA:{orig_direction} -> EKSEKUSI:{execution_side} "
+            f"| LOGIKA:{_entry_mode_name()} (Flips:{_flip_count}) @ {fill_price:.8g} "
+            f"| qty:{actual_qty:.8g} | margin:~${margin_used:.2f} | leverage:{LEVERAGE}x "
             f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
         )
         print(f"         Signals: {' | '.join(sigs[:6])}")
@@ -1849,19 +1872,10 @@ def live_close(sym, reason, price=None):
         "order_id": response.get("orderId"),
     })
 
-    if reason == "SL":
-        # SL: ban 30m dulu. Mode flip baru aktif setelah ban selesai.
-        _activate_sl_ban_and_liquidate(sym)
-    elif reason == "CASCADE_AFTER_SL" and CASCADE_BAN_SECONDS > 0:
-        _activate_aux_ban("CASCADE", CASCADE_BAN_SECONDS, sym)
-    elif reason == "TIME_LIMIT":
-        # TIME_LIMIT LOSS: force the NEXT NEW ENTRY to the opposite side
-        # of the position that just lost. No ban.
-        # TIME_LIMIT profit/flat: no force, no ban.
-        if pnl < 0:
-            _set_forced_next_entry_after_time_loss(sym, side, pnl)
-
-    _maybe_activate_profit_guard()
+    # UPDATE DYNAMIC INVERSION STATE MACHINE:
+    # - Kena SL atau TIME_LIMIT dengan minus -> Mode DIBALIK (Toggle NORMAL <-> INVERTED)
+    # - Kena TP atau TIME_LIMIT dengan profit -> Mode TETAP (dipertahankan)
+    _handle_strategy_outcome(reason, pnl, sym)
 
     with _lock:
         cooldown_list[sym] = time.time() + COOLDOWN_SEC
@@ -1881,12 +1895,12 @@ def _check_time_limit_stage(sym, pos, px):
     if floating_pnl < 0:
         print(
             f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
-            f"Float:{floating_pnl:+.5f}U < 0 → close + GLOBAL FLIP"
+            f"Float:{floating_pnl:+.5f}U < 0 → close (MINUS: Ganti Mode)"
         )
     else:
         print(
             f"  ⏰ {sym}: HARD TIME_LIMIT {hold_time/60:.1f}m | "
-            f"Float:{floating_pnl:+.5f}U >= 0 → close TANPA FLIP/BAN"
+            f"Float:{floating_pnl:+.5f}U >= 0 → close (PROFIT: Pertahankan Mode)"
         )
 
     live_close(sym, "TIME_LIMIT", px)
@@ -2085,7 +2099,7 @@ def print_full():
 
     print(f"    🛑 Circuit: {circuit if circuit else 'READY'} | SL:{_stats['sl_ban_count']} | CascadeBan:{_stats['cascade_ban_count']} | TimeBan:{_stats['time_limit_ban_count']}")
     print(f"    🧱 ProfitGuard:{_stats['profit_guard_count']} | Cascade Close:{_stats['sl_cascade_closes']} | ATH{guard_info}")
-    print(f"    🕐 TIME ENGINE: HARD MAX 30m | STRATEGY: COUNTER-FAILURE TRAP FADE + SCALP TP")
+    print(f"    🕐 STRATEGY ENGINE: MODE=[{_strategy_mode}] (Flips:{_flip_count}) | MAX 1 POS | MARGIN: $3.00 | NO BANS")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2388,14 +2402,16 @@ def demo_preflight_account(syms):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.1 — COUNTER-FAILURE TRAP SCALPER            ║")
-    print("║  1. RANGE/EXHAUSTION: FADE THE TRAP (Inversi Pemicu Loss)         ║")
-    print("║  2. TP REALISTIS: 0.7–1.5% (Tercapai dalam 10-20m)                ║")
-    print("║  3. SL: 0.9–1.8% | EXIT -> REAL DEMO reduceOnly MARKET            ║")
-    print("║  4. HAPUS BLIND FLIP: Analisa teknikal murni per koin            ║")
-    print("║  5. TANPA SL BAN (Entry langsung lanjut) + Profit Guard aktif     ║")
-    print("║  6. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
-    print("║  7. ORDER MARGIN: TARGET $2.00 | MAX $2.10 | LOT-SIZE AWARE      ║")
+    print("║  💎 BOT SCALPING v23.0 — DYNAMIC INVERSION STATE ENGINE          ║")
+    print("║  1. START MODE: NORMAL (Analisa LONG -> LONG, SHORT -> SHORT)     ║")
+    print("║  2. LOSS TRIGGER (SL / MINUS TIME_LIMIT): TOGGLE KEBALIKAN        ║")
+    print("║     * Dari NORMAL -> Jadi INVERTED (LONG -> SHORT, SHORT -> LONG) ║")
+    print("║     * Dari INVERTED -> Jadi NORMAL kembali                        ║")
+    print("║  3. PROFIT TRIGGER: PERTAHANKAN MODE SAAT INI (TIDAK BERUBAH)     ║")
+    print("║  4. POSISI: TETAP MAKSIMAL 1 POSISI                              ║")
+    print("║  5. MARGIN: $3.00 USDT PER POSISI (LEVERAGE 25x)                 ║")
+    print("║  6. BEBAS BAN: TIDAK ADA BAN (Entry langsung jalan terus)        ║")
+    print("║  7. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
     try:
