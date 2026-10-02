@@ -104,7 +104,7 @@ twm = _create_twm()
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 25
-ORDER_USDT    = 2.5
+ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
 # ── LOSS CIRCUIT / NO ENTRY BANS ───────────────────────────────────────────
