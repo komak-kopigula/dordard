@@ -13,7 +13,7 @@ ATURAN ENTRY & STATE MACHINE STRATEGI:
      * Terus berganti setiap kali mengalami loss.
 3. Kondisi Profit (Kena TP atau Kena TIME_LIMIT dengan profit):
    - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif).
-4. Konfigurasi:
+4. Konfigurasi
    - MAX_POSITIONS = 1
    - MARGIN TARGET = $3.00 USDT per posisi (ceiling $3.10 setelah rounding exchange)
    - TANPA BAN: tidak ada SL ban, cascade ban, time-limit ban, cooldown, atau profit-guard ban.
