@@ -1,5 +1,5 @@
 """
-Bot Scalping v24.0 — BINANCE FUTURES DEMO — LOSS TOGGLE STATE ENGINE
+Bot Scalping v25.0 — BINANCE FUTURES DEMO — EXACT LOSS TOGGLE + ONLINE ML ENGINE
 ================================================================================
 ATURAN ENTRY & STATE MACHINE STRATEGI:
 1. Entry Awal (Mode NORMAL):
@@ -12,12 +12,13 @@ ATURAN ENTRY & STATE MACHINE STRATEGI:
      * Dari INVERTED berubah kembali jadi NORMAL (analisa LONG jadi LONG, SHORT jadi SHORT).
      * Terus berganti setiap kali mengalami loss.
 3. Kondisi Profit (Kena TP atau Kena TIME_LIMIT dengan profit):
-   - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif)..
+   - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif).
 4. Konfigurasi:
    - MAX_POSITIONS = 1
    - MARGIN TARGET = $3.00 USDT per posisi (ceiling $3.10 setelah rounding exchange)
    - TANPA BAN: tidak ada SL ban, cascade ban, time-limit ban, cooldown, atau profit-guard ban.
    - TIDAK ADA SIGNAL FLIP EXIT; hanya state toggle setelah loss.
+   - ONLINE ML: belajar dari hasil trade nyata dan hanya memfilter kandidat setelah warm-up; ML tidak boleh mengubah arah.
    - REST execution endpoint: https://demo-fapi.binance.com/fapi
 """
 
@@ -33,6 +34,8 @@ import os
 import time
 import inspect
 import math
+import json
+from pathlib import Path
 import threading
 import queue
 import numpy as np
@@ -155,22 +158,17 @@ MIN_SCORE      = 65       # Naikkan kualitas kandidat; lebih selektif
 SLIPPAGE_GUARD = 0.0015
 TTL_5M         = 2
 
-# Saat MODE=INVERTED, arah tetap WAJIB dibalik sesuai state machine.
-# Gate ini hanya memastikan arah lawan punya bukti reversal/minor confirmation,
-# sehingga bot tidak asal counter-trend setelah satu loss.
-INVERTED_MIN_EXEC_SCORE = 35
-INVERTED_MIN_CONFIRMATIONS = 2
 
 # ── Dynamic Volatility Risk Management (Realistic Scalping Calibration) ────
 # Risk/reward diperbaiki: TP dibuat lebih besar daripada SL.
 # Tujuannya menurunkan break-even win-rate setelah fee, tanpa mengubah
 # aturan 30 menit dan tanpa menambah trailing/signal-flip.
-ATR_TP_RESTORED_MULTIPLIER = 1.35
-ATR_SL_RESTORED_MULTIPLIER = 0.85
-MIN_TP_PCT = 0.010   # 1.0%
-MAX_TP_PCT = 0.020   # 2.0%
-MIN_SL_PCT = 0.0065  # 0.65%
-MAX_SL_PCT = 0.012   # 1.20%
+ATR_TP_RESTORED_MULTIPLIER = 1.20
+ATR_SL_RESTORED_MULTIPLIER = 0.75
+MIN_TP_PCT = 0.009   # 0.9%
+MAX_TP_PCT = 0.016   # 1.6%
+MIN_SL_PCT = 0.0055  # 0.55%
+MAX_SL_PCT = 0.0095  # 0.95%
 
 # Legacy constant kept for compatibility in any external references.
 # Actual hold logic is now controlled by the two-stage engine above.
@@ -737,6 +735,173 @@ class LearningLayer:
         return sum(peaks) / len(peaks) if peaks else 0.0
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  ONLINE MACHINE LEARNING — NUMPY LOGISTIC REGRESSION
+# ═══════════════════════════════════════════════════════════════════════════
+ML_ENABLED = True
+ML_MIN_SAMPLES = 8
+ML_MIN_PROBA = 0.44
+ML_MIN_EV_PCT = 0.00005
+ML_REPLAY_FILE = "ml_trade_replay_v25.json"
+ML_REPLAY_MAX = 300
+ML_EPOCHS_PER_UPDATE = 4
+ML_LR = 0.035
+ML_L2 = 0.01
+
+
+class OnlineTradeML:
+    """Online win-probability model. It filters/ranks candidates only.
+
+    Crucially, it never changes the exact user-defined NORMAL/INVERTED
+    direction mapping.
+    """
+    FEATURE_NAMES = [
+        "analysis_side", "execution_side", "mode_inverted", "technical_score",
+        "regime_bias", "ema_atr_distance", "m5_momentum", "m3_momentum",
+        "macd_atr", "delta_ratio", "buy_ratio_centered", "rsi_centered",
+        "adx_norm", "atr_pct", "orderbook_imbalance", "volume_ratio",
+        "candle_gap", "symbol_winrate", "regime_winrate",
+    ]
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.n_features = len(self.FEATURE_NAMES)
+        self.w = np.zeros(self.n_features, dtype=float)
+        self.b = 0.0
+        self.samples = deque(maxlen=ML_REPLAY_MAX)
+        self.last_prob = 0.5
+        self.trained_updates = 0
+        self._load()
+        self._fit_locked()
+
+    @staticmethod
+    def _sigmoid(z):
+        z = float(np.clip(z, -25.0, 25.0))
+        return 1.0 / (1.0 + math.exp(-z))
+
+    @staticmethod
+    def _clip(v, lo=-5.0, hi=5.0):
+        try:
+            return float(np.clip(float(v), lo, hi))
+        except Exception:
+            return 0.0
+
+    def _load(self):
+        try:
+            p = Path(ML_REPLAY_FILE)
+            if not p.exists():
+                return
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            for item in raw[-ML_REPLAY_MAX:]:
+                x, y = item.get("x"), item.get("y")
+                if isinstance(x, list) and len(x) == self.n_features and y in (0, 1):
+                    self.samples.append((np.asarray(x, dtype=float), int(y)))
+        except Exception:
+            pass
+
+    def _save_locked(self):
+        try:
+            raw = [{"x": x.tolist(), "y": int(y)} for x, y in self.samples]
+            Path(ML_REPLAY_FILE).write_text(json.dumps(raw, separators=(",", ":")), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _fit_locked(self):
+        if not self.samples:
+            self.w[:] = 0.0
+            self.b = 0.0
+            return
+
+        X = np.vstack([x for x, _ in self.samples])
+        y = np.asarray([y for _, y in self.samples], dtype=float)
+        n = len(y)
+        pos_n = max(1, int(y.sum()))
+        neg_n = max(1, n - pos_n)
+        weights = np.where(y > 0.5, n / (2.0 * pos_n), n / (2.0 * neg_n))
+
+        w = np.zeros(self.n_features, dtype=float)
+        b = 0.0
+        for _ in range(ML_EPOCHS_PER_UPDATE):
+            z = np.clip(X @ w + b, -25.0, 25.0)
+            pred = 1.0 / (1.0 + np.exp(-z))
+            err = (pred - y) * weights
+            denom = float(weights.sum())
+            grad_w = (X.T @ err) / denom + ML_L2 * w
+            grad_b = float(err.sum() / denom)
+            w -= ML_LR * grad_w
+            b -= ML_LR * grad_b
+
+        self.w = w
+        self.b = float(b)
+        self.trained_updates += 1
+
+    def add_result(self, x, won):
+        if not ML_ENABLED or x is None:
+            return
+        with self.lock:
+            arr = np.asarray(x, dtype=float)
+            if arr.shape != (self.n_features,):
+                return
+            self.samples.append((arr, 1 if won else 0))
+            self._fit_locked()
+            self._save_locked()
+
+    def predict_proba(self, x):
+        if not ML_ENABLED or x is None:
+            return 0.5
+        with self.lock:
+            if len(self.samples) < ML_MIN_SAMPLES:
+                return 0.5
+            arr = np.asarray(x, dtype=float)
+            if arr.shape != (self.n_features,):
+                return 0.5
+            p = self._sigmoid(arr @ self.w + self.b)
+            self.last_prob = p
+            return p
+
+    def status(self):
+        with self.lock:
+            return len(self.samples), self.last_prob
+
+    def build_features(self, sym, df, analysis_side, execution_side, score, regime, bias, atr, px_live):
+        try:
+            row = df.iloc[-2]
+            close = float(row.get("close", 0.0))
+            e5 = float(row.get("e5", close))
+            atr_v = max(float(atr), 1e-12)
+            mode_inv = 1.0 if _entry_mode_name() == "INVERTED" else 0.0
+            imb = order_book.get_imbalance(sym)
+            symbol_wr = 0.5
+            regime_wr = 0.5
+            if "learning" in globals():
+                st = learning.stats_by_symbol.get(sym, {"wins": 0, "losses": 0})
+                symbol_wr = (st.get("wins", 0) + 2.0) / (st.get("wins", 0) + st.get("losses", 0) + 4.0)
+                rt = learning.stats_by_regime.get(regime, {"wins": 0, "losses": 0})
+                regime_wr = (rt.get("wins", 0) + 2.0) / (rt.get("wins", 0) + rt.get("losses", 0) + 4.0)
+            return np.asarray([
+                1.0 if analysis_side == "LONG" else -1.0,
+                1.0 if execution_side == "LONG" else -1.0,
+                mode_inv,
+                self._clip(score / 100.0, -2.0, 2.0),
+                self._clip(float(bias), -1.5, 1.5),
+                self._clip((close - e5) / atr_v, -5.0, 5.0),
+                self._clip(float(row.get("m5", 0.0)) * 100.0, -5.0, 5.0),
+                self._clip(float(row.get("m3", 0.0)) * 100.0, -5.0, 5.0),
+                self._clip(float(row.get("mh", 0.0)) / atr_v, -5.0, 5.0),
+                self._clip(float(row.get("delta_ratio", 0.0)), -1.0, 1.0),
+                self._clip((float(row.get("br", 0.5)) - 0.5) * 2.0, -1.0, 1.0),
+                self._clip((float(row.get("rsi", 50.0)) - 50.0) / 25.0, -2.0, 2.0),
+                self._clip(float(row.get("adx", 0.0)) / 50.0, 0.0, 2.0),
+                self._clip(float(row.get("atr", atr_v)) / max(close, 1e-12) * 100.0, 0.0, 5.0),
+                self._clip(imb, -1.0, 1.0),
+                self._clip(float(row.get("vr", 1.0)) / 2.0, 0.0, 3.0),
+                self._clip(abs(px_live - close) / max(close, 1e-12) * 100.0, 0.0, 3.0),
+                self._clip(symbol_wr, 0.0, 1.0),
+                self._clip(regime_wr, 0.0, 1.0),
+            ], dtype=float)
+        except Exception:
+            return np.zeros(self.n_features, dtype=float)
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  GLOBAL STATE & UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -769,10 +934,10 @@ _stats = {
     "profit_guard_count": 0,
     "time_grace_entries": 0,
     "time_grace_exits": 0,
+    "time_limit_loss": 0,
 }
 
 live_positions = {}
-cooldown_list = {}
 # Symbols whose exchange lot/min-notional rules cannot fit the configured margin ceiling.
 # They are skipped temporarily so the scanner moves on instead of retry-spamming them.
 _sizing_unavailable_until = {}
@@ -782,6 +947,7 @@ trade_log = []
 signal_weights = SignalWeights()
 scorer = SignalScorer(signal_weights)
 learning = LearningLayer(signal_weights)
+ml_engine = OnlineTradeML()
 
 _last_err_print = defaultdict(float)
 _api_fail_streak = 0
@@ -797,29 +963,24 @@ _sl_ban_until = 0.0
 _sl_ban_reason = ""
 _sl_ban_trigger = ""
 
-# ADAPTIVE NEXT-ENTRY DIRECTION --------------------------------------------
-# TIME_LIMIT loss does NOT permanently invert the strategy.
-# Instead, the next new entry is FORCED to the opposite side of the position
-# that just realized the TIME_LIMIT loss, regardless of the scanner signal.
+# ═══════════════════════════════════════════════════════════════════════════
+#  EXACT LOSS-TOGGLE STATE MACHINE
+# ═══════════════════════════════════════════════════════════════════════════
+# User rule — this is the ONLY mechanism allowed to transform entry direction.
+# NORMAL:   analysis LONG -> LONG, analysis SHORT -> SHORT
+# INVERTED: analysis LONG -> SHORT, analysis SHORT -> LONG
 #
-# Example:
-#   LONG -> TIME_LIMIT loss -> next entry MUST be SHORT
-#   SHORT -> TIME_LIMIT loss -> next entry MUST be LONG
+# LOSS EVENTS THAT TOGGLE:
+#   * SL (always toggles)
+#   * TIME_LIMIT with realized PnL < 0 (toggles)
 #
-# After that forced entry is successfully opened, the force is consumed and
-# ── DYNAMIC INVERSION STATE ENGINE ─────────────────────────────────────────
-# State Machine:
-# 1. Start: NORMAL mode (LONG -> LONG, SHORT -> SHORT)
-# 2. Ketika posisi LOSS (kena SL atau TIME_LIMIT dengan minus):
-#    Mode DIBALIK (Toggle):
-#    * Dari NORMAL -> Jadi INVERTED (LONG -> SHORT, SHORT -> LONG)
-#    * Dari INVERTED -> Jadi NORMAL kembali (LONG -> LONG, SHORT -> SHORT)
-# 3. Ketika posisi PROFIT (kena TP atau TIME_LIMIT dengan profit):
-#    Mode TIDAK BERUBAH (tetap mempertahankan mode yang sedang aktif).
-# 4. Tanpa blind signal flip lintas koin acak; analisa sinyal tetap dilakukan
-#    secara menyeluruh, lalu arahnya disesuaikan dengan status mode state machine.
+# PROFIT EVENTS THAT KEEP MODE:
+#   * TP
+#   * TIME_LIMIT with realized PnL >= 0
+#
+# No signal-flip exit, no forced-entry queue, no trading cooldown, no ban.
 _entry_mode_lock = threading.Lock()
-_strategy_mode = "NORMAL"  # Starts in NORMAL mode
+_strategy_mode = "NORMAL"
 _flip_count = 0
 
 
@@ -833,59 +994,34 @@ def _entry_mode_status():
         return f"{_strategy_mode} (Flips:{_flip_count})"
 
 
-def _get_execution_side(orig_direction):
-    """Return the execution side according to the current strategy mode.
-    - NORMAL: analisa bot LONG -> LONG, analisa bot SHORT -> SHORT
-    - INVERTED: analisa bot LONG -> SHORT, analisa bot SHORT -> LONG
-    """
+def _get_execution_side(analysis_direction):
+    if analysis_direction not in ("LONG", "SHORT"):
+        return None
     with _entry_mode_lock:
         mode = _strategy_mode
     if mode == "INVERTED":
-        return "SHORT" if orig_direction == "LONG" else "LONG"
-    return orig_direction
+        return "SHORT" if analysis_direction == "LONG" else "LONG"
+    return analysis_direction
 
 
 def _handle_strategy_outcome(reason, pnl, sym):
-    """Global entry-mode state machine.
-
-    NORMAL:
-        analysis LONG  -> LONG
-        analysis SHORT -> SHORT
-
-    INVERTED:
-        analysis LONG  -> SHORT
-        analysis SHORT -> LONG
-
-    ONLY these events toggle the mode:
-      - SL
-      - TIME_LIMIT with realized PnL < 0
-
-    TP and TIME_LIMIT with realized PnL >= 0 preserve the current mode.
-    """
     global _strategy_mode, _flip_count
 
-    is_sl_loss = (reason == "SL")
-    is_time_loss = (reason == "TIME_LIMIT" and pnl < -1e-9)
-    is_loss = is_sl_loss or is_time_loss
-
+    toggle = (reason == "SL") or (reason == "TIME_LIMIT" and pnl < -1e-9)
     with _entry_mode_lock:
         old_mode = _strategy_mode
-
-        if is_loss:
+        if toggle:
             _strategy_mode = "INVERTED" if old_mode == "NORMAL" else "NORMAL"
             _flip_count += 1
-            new_mode = _strategy_mode
             print(
-                f"\n  🔄 [LOSS TOGGLE] {sym} {reason} PnL:{pnl:+.5f}U "
-                f"→ {old_mode} ➔ {new_mode} | Flip #{_flip_count}"
+                f"\n  🔄 [EXACT LOSS TOGGLE] {sym} | {reason} | PnL:{pnl:+.5f}U "
+                f"| {old_mode} ➜ {_strategy_mode} | Flip #{_flip_count}"
             )
         else:
             print(
-                f"\n  ✅ [MODE KEEP] {sym} {reason} PnL:{pnl:+.5f}U "
-                f"→ Mode tetap {old_mode}"
+                f"\n  ✅ [MODE KEEP] {sym} | {reason} | PnL:{pnl:+.5f}U "
+                f"| Mode tetap {old_mode}"
             )
-
-
 
 _cascade_ban_until = 0.0
 _cascade_ban_trigger = ""
@@ -1064,52 +1200,47 @@ def _round_qty_up(q, step, precision):
 
 
 def qty(symbol, price):
-    """Build the smallest valid quantity near $3 margin with a $3.10 ceiling.
-
-    Priority:
-      1. satisfy symbol LOT_SIZE/MARKET_LOT_SIZE;
-      2. satisfy symbol MIN_NOTIONAL/NOTIONAL if present;
-      3. target ORDER_USDT (= $3.00) at current leverage;
-      4. never silently exceed DEMO_MAX_MARGIN_USDT (= $3.10) initial margin.
-    """
+    """Return the exchange-valid quantity closest to exactly $3 margin."""
     if price <= 0:
         return 0.0
-
     rules = _get_symbol_rules(symbol)
-    step = rules["step_size"]
-    min_qty = rules["min_qty"]
-    max_qty = rules["max_qty"]
-    precision = rules["precision"]
-    min_notional = rules["min_notional"]
+    step = float(rules.get("step_size", 0.0) or 0.0)
+    min_qty = float(rules.get("min_qty", 0.0) or 0.0)
+    max_qty = float(rules.get("max_qty", 0.0) or 0.0)
+    precision = int(rules.get("precision", 8))
+    min_notional = float(rules.get("min_notional", 0.0) or 0.0)
 
-    target_notional = ORDER_USDT * LEVERAGE
+    target_notional = max(DEMO_TARGET_MARGIN_USDT * LEVERAGE,
+                          min_notional + DEMO_NOTIONAL_BUFFER_USDT)
     max_notional = DEMO_MAX_MARGIN_USDT * LEVERAGE
-
-    # Use the exchange's actual minimum, but never exceed the margin ceiling.
-    required_notional = max(target_notional, min_notional + DEMO_NOTIONAL_BUFFER_USDT)
-    raw = required_notional / price
-    q_val = _round_qty_up(raw, step, precision)
-
-    if min_qty > 0:
-        q_val = max(q_val, min_qty)
-        q_val = _round_qty_up(q_val, step, precision)
-
-    # Re-check after rounding: increase by exactly one lot until valid.
-    while q_val > 0 and q_val * price + 1e-9 < min_notional + DEMO_NOTIONAL_BUFFER_USDT:
-        if step <= 0:
-            break
-        q_val = round(q_val + step, precision)
-
-    if max_qty > 0 and q_val > max_qty:
+    if target_notional > max_notional + 1e-9:
         return 0.0
 
-    # If the symbol's lot step makes the next valid quantity exceed the user's
-    # margin ceiling, do not open an unexpectedly large position.
-    margin = (q_val * price) / LEVERAGE if q_val > 0 else 0.0
-    if margin > DEMO_MAX_MARGIN_USDT + 1e-9:
+    raw = target_notional / price
+    bases = [raw]
+    if step > 0:
+        bases += [math.floor(raw / step) * step, math.ceil(raw / step) * step]
+    candidates = []
+    for q_val in bases:
+        if step > 0:
+            q_val = round(q_val / step) * step
+        q_val = round(float(q_val), precision)
+        if min_qty > 0 and q_val < min_qty:
+            q_val = _round_qty_up(min_qty, step, precision)
+        if q_val <= 0 or (max_qty > 0 and q_val > max_qty):
+            continue
+        notional = q_val * price
+        if notional + 1e-9 < min_notional + DEMO_NOTIONAL_BUFFER_USDT:
+            continue
+        if notional > max_notional + 1e-9:
+            continue
+        margin = notional / LEVERAGE
+        candidates.append((abs(margin - DEMO_TARGET_MARGIN_USDT), q_val))
+    if not candidates:
         return 0.0
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
-    return q_val
 
 def _fmt_qty(symbol, q_val):
     precision = get_precision(symbol)
@@ -1635,7 +1766,7 @@ def _sizing_skip_message(sym):
     return f"{sym} dilewati {rem:.0f}s — {reason}"
 
 
-def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
+def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile, ml_prob=0.5, ml_features=None):
     """Open a REAL position on Binance Futures DEMO and mirror the verified fill locally."""
     if not DEMO_TRADING:
         raise RuntimeError("DEMO_TRADING must remain True")
@@ -1685,6 +1816,15 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         )
         now = time.time()
 
+        if ml_features is None:
+            try:
+                ml_features = ml_engine.build_features(
+                    sym, ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100),
+                    orig_direction, execution_side, score, regime, bias, atr, fill_price
+                )
+            except Exception:
+                ml_features = None
+
         pos = {
             "side": execution_side,
             "orig_signal": orig_direction,
@@ -1708,6 +1848,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             "grace_until": None,
             "grace_start_pnl": None,
             "_time_grace_warned": False,
+            "ml_prob_entry": float(ml_prob),
+            "ml_features": ml_features.tolist() if isinstance(ml_features, np.ndarray) else ml_features,
         }
 
         with _lock:
@@ -1718,7 +1860,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             f"\n  🚀 [DEMO REAL ENTRY] {sym} ANALISA:{orig_direction} -> EKSEKUSI:{execution_side} "
             f"| MODE:{_entry_mode_name()} (Flips:{_flip_count}) @ {fill_price:.8g} "
             f"| qty:{actual_qty:.8g} | margin:~${margin_used:.2f} | leverage:{LEVERAGE}x "
-            f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}%"
+            f"| TP:{new_risk['tp_pct']*100:.2f}% | SL:{new_risk['sl_pct']*100:.2f}% | ML-P:{ml_prob*100:.0f}%"
         )
         print(f"         Signals: {' | '.join(sigs[:6])}")
         _stats["trades"] += 1
@@ -1854,10 +1996,15 @@ def live_close(sym, reason, price=None):
         _stats["tp_exit"] += 1
     elif reason == "TIME_LIMIT_GRACE_DRAWDOWN":
         _stats["time_grace_exits"] += 1
+    if reason == "TIME_LIMIT" and pnl < 0:
+        _stats["time_limit_loss"] += 1
 
     trade_log.append({
         "sym": sym,
         "side": side,
+        "analysis": pos.get("orig_signal", "?"),
+        "mode": "INVERTED" if pos.get("orig_signal") != side else "NORMAL",
+        "ml_p": round(float(pos.get("ml_prob_entry", 0.5)), 4),
         "entry": round(entry, 7),
         "exit": round(fill_price, 7),
         "pnl": round(pnl, 5),
@@ -1866,9 +2013,15 @@ def live_close(sym, reason, price=None):
         "order_id": response.get("orderId"),
     })
 
-    # UPDATE DYNAMIC INVERSION STATE MACHINE:
-    # - Kena SL atau TIME_LIMIT dengan minus -> Mode DIBALIK (Toggle NORMAL <-> INVERTED)
-    # - Kena TP atau TIME_LIMIT dengan profit -> Mode TETAP (dipertahankan)
+    # ML learns only from the completed trade outcome.
+    try:
+        feat = pos.get("ml_features")
+        if feat is not None:
+            ml_engine.add_result(np.asarray(feat, dtype=float), won)
+    except Exception as e:
+        _log_err("ml_train", e, cooldown=30)
+
+    # EXACT STATE TRANSITION — only SL / losing TIME_LIMIT can toggle.
     _handle_strategy_outcome(reason, pnl, sym)
 
     _hot_syms.appendleft(sym)
@@ -1949,65 +2102,6 @@ def monitor_positions():
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _inverted_quality_gate(df: pd.DataFrame, sym: str, execution_side: str) -> Tuple[bool, int, int]:
-    """Quality gate for INVERTED mode.
-
-    It never changes the required opposite direction. It only rejects an
-    inverted entry when the execution side has too little supporting evidence.
-    """
-    try:
-        row = df.iloc[-2]
-        prev = df.iloc[-3]
-
-        if execution_side == "LONG":
-            exec_score, _ = scorer._score_long(df, sym)
-            bull_abs, _, _ = AbsorptionDetector.detect(df)
-            confirmations = 0
-
-            if row["rsi"] <= 45:
-                confirmations += 1
-            if row["mh"] > prev["mh"]:
-                confirmations += 1
-            if row.get("delta_ratio", 0.0) > 0.08 or row.get("br", 0.5) > 0.54:
-                confirmations += 1
-            if bull_abs:
-                confirmations += 1
-            if order_book.get_imbalance(sym) > 0.10:
-                confirmations += 1
-            if row["close"] > row["e5"]:
-                confirmations += 1
-
-        elif execution_side == "SHORT":
-            exec_score, _ = scorer._score_short(df, sym)
-            _, bear_abs, _ = AbsorptionDetector.detect(df)
-            confirmations = 0
-
-            if row["rsi"] >= 55:
-                confirmations += 1
-            if row["mh"] < prev["mh"]:
-                confirmations += 1
-            if row.get("delta_ratio", 0.0) < -0.08 or row.get("br", 0.5) < 0.46:
-                confirmations += 1
-            if bear_abs:
-                confirmations += 1
-            if order_book.get_imbalance(sym) < -0.10:
-                confirmations += 1
-            if row["close"] < row["e5"]:
-                confirmations += 1
-
-        else:
-            return False, 0, 0
-
-        ok = (
-            exec_score >= INVERTED_MIN_EXEC_SCORE
-            and confirmations >= INVERTED_MIN_CONFIRMATIONS
-        )
-        return ok, int(exec_score), int(confirmations)
-
-    except Exception:
-        return False, 0, 0
-
-
 def scan_one(sym):
     try:
         time.sleep(0.002)
@@ -2015,83 +2109,93 @@ def scan_one(sym):
         if df is None:
             return None
         df_ta = run_ta(df.copy())
-        px_candle, atr_val = df_ta["close"].iloc[-2], df_ta["atr"].iloc[-2]
-        if px_candle == 0 or np.isnan(atr_val):
+        if len(df_ta) < 55:
             return None
 
-        orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
-        if orig_direction is None:
+        px_candle = float(df_ta["close"].iloc[-2])
+        atr_val = float(df_ta["atr"].iloc[-2])
+        if px_candle <= 0 or not np.isfinite(atr_val) or atr_val <= 0:
             return None
-        if orig_direction not in ("LONG", "SHORT"):
+
+        # 1) Technical analysis decides the analysis direction.
+        analysis_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
+        if analysis_direction not in ("LONG", "SHORT"):
             return None
-        # Global state menentukan arah EKSEKUSI; analisa tetap berasal dari
-        # scorer normal. Posisi yang sudah terbuka tidak disentuh.
-        execution_side = _get_execution_side(orig_direction)
+
+        # 2) EXACT state transformation. ML is never allowed to rewrite this.
+        execution_side = _get_execution_side(analysis_direction)
+        if execution_side not in ("LONG", "SHORT"):
+            return None
 
         px_live = price_live(sym)
-        if px_live == 0:
+        if px_live <= 0:
             return None
 
-        # Hindari entry terlalu jauh dari candle yang menjadi dasar analisa.
         candle_gap = abs(px_live - px_candle) / px_candle if px_candle > 0 else 1.0
         if candle_gap > 0.0035:
             return None
 
-        # Dalam INVERTED mode, arah tetap dibalik, tetapi entry lawan
-        # membutuhkan konfirmasi reversal agar tidak asal counter-trend.
-        if _entry_mode_name() == "INVERTED":
-            inv_ok, _, _ = _inverted_quality_gate(df_ta, sym, execution_side)
-            if not inv_ok:
-                return None
-
-        # Sizing is a candidate filter: if this symbol cannot fit the configured
-        # margin after Binance lot/min-notional rules, skip it BEFORE it reaches
-        # live_open(). The scanner then naturally selects another valid coin.
-        if _sizing_is_blocked(sym):
-            return None
+        # 3) Exact ~$3 margin sizing; invalid symbols are skipped, not retried/spammed.
         try:
             q_candidate = qty(sym, px_live)
         except Exception as e:
             _mark_sizing_unavailable(sym, f"gagal membaca aturan quantity: {e}")
             return None
         if q_candidate <= 0:
-            reason = (
-                f"lot/min-notional exchange tidak muat pada margin <= {DEMO_MAX_MARGIN_USDT:.2f} USDT "
-                f"dengan leverage {LEVERAGE}x"
+            _mark_sizing_unavailable(
+                sym,
+                f"exchange lot/min-notional tidak muat dekat ${DEMO_TARGET_MARGIN_USDT:.2f} margin"
             )
-            _mark_sizing_unavailable(sym, reason)
             return None
 
-        btc_vetoed, btc_reason = btc_macro.check_veto(execution_side)
+        # 4) Market-data vetoes only; none of them flip direction.
+        btc_vetoed, _ = btc_macro.check_veto(execution_side)
         if btc_vetoed:
             _stats["btc_breaker_veto"] += 1
-            print(f"  ⛔ [{sym}] {execution_side} VETOED by BTC Circuit Breaker: {btc_reason}")
             return None
 
-        has_wall, wall_type, wall_px, wall_qty, wall_mult = order_book.check_walls(sym, px_live, execution_side)
+        has_wall, _, _, _, _ = order_book.check_walls(sym, px_live, execution_side)
         if has_wall:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] {execution_side} VETOED by {wall_type} @ {wall_px:.6g} (qty:{wall_qty:.1f}, {wall_mult:.1f}x avg depth)")
             return None
 
-        is_spoof, spoof_reason = order_book.detect_spoofing(sym, execution_side)
+        is_spoof, _ = order_book.detect_spoofing(sym, execution_side)
         if is_spoof:
             _stats["spoof_veto"] += 1
-            print(f"  ⛔ [{sym}] {execution_side} VETOED: Spoofing detected ({spoof_reason})")
             return None
 
         imb = order_book.get_imbalance(sym)
         if execution_side == "LONG" and imb < -0.40:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] LONG VETOED: Heavy Ask Queue Imbalance ({imb*100:.0f}%)")
             return None
         if execution_side == "SHORT" and imb > 0.40:
             _stats["wall_veto"] += 1
-            print(f"  ⛔ [{sym}] SHORT VETOED: Heavy Bid Queue Imbalance ({imb*100:.0f}%)")
             return None
 
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
-        return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
+        ml_features = ml_engine.build_features(
+            sym, df_ta, analysis_direction, execution_side, score, regime, bias, atr_val, px_live
+        )
+        ml_prob = ml_engine.predict_proba(ml_features)
+        ml_n, _ = ml_engine.status()
+
+        # 5) ML filter activates only after enough realized examples.
+        # It filters a candidate; it NEVER substitutes the requested opposite side.
+        if ML_ENABLED and ml_n >= ML_MIN_SAMPLES:
+            tp_pct = float(risk_profile["tp_pct"])
+            sl_pct = float(risk_profile["sl_pct"])
+            fee_pct = 0.0010
+            expected_pct = ml_prob * tp_pct - (1.0 - ml_prob) * sl_pct - fee_pct
+            if ml_prob < ML_MIN_PROBA or expected_pct < ML_MIN_EV_PCT:
+                return None
+        rank_score = float(score)
+        if ml_n >= ML_MIN_SAMPLES:
+            rank_score += max(0.0, ml_prob - 0.5) * 15.0
+
+        return (
+            sym, analysis_direction, rank_score, sigs, px_live, atr_val,
+            regime, bias, risk_profile, ml_prob, ml_features
+        )
     except Exception as e:
         _log_err(f"scan_one_{sym}", e)
         return None
@@ -2123,7 +2227,7 @@ def print_inline():
     aw = learning.avg_win()
     avg_pk = learning.avg_peak_win()
     e = "💚" if pnl >= 0 else "🔴"
-    print(f"       ┌ [DEMO ENGINE v22] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
+    print(f"       ┌ [DEMO ENGINE v25] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U (ATH:{_stats['ath_pnl']:+.4f}U)")
     circuit, _ = _circuit_snapshot()
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} Absorb:{_stats['absorb_entries']} | Circuit:{circuit or 'READY'} | Cascade:{_stats['sl_cascade_closes']} | Grace:{_stats['time_grace_entries']} | AvgWin:{aw:+.4f}U | Peak:{avg_pk*100:.3f}%")
 
@@ -2139,10 +2243,10 @@ def print_full():
     bep = al / (al + aw) * 100 if (al + aw) > 0 else 50
 
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING v22 DEMO — LIVE MARKET DATA")
+    print(f"    🔔 INSTITUTIONAL SCALPING v25 DEMO — LIVE MARKET DATA")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U | Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimitLoss:{_stats['time_grace_exits']}")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimitLoss:{_stats['time_limit_loss']}")
 
     circuit, _ = _circuit_snapshot()
     if _stats["ath_pnl"] >= PROFIT_GUARD_ARM_PNL:
@@ -2164,6 +2268,10 @@ def print_full():
     print("    🛑 BANS: OFF | SL-BAN:0 | CASCADE-BAN:0 | TIME-BAN:0 | PROFIT-GUARD-BAN:0")
     print(f"    🧱 ProfitGuard:DISABLED | Cascade Close:DISABLED | ATH{guard_info}")
     print(f"    🕐 STRATEGY ENGINE: MODE=[{_strategy_mode}] (Flips:{_flip_count}) | MAX 1 POS | MARGIN: $3.00 | NO BANS | NO SIGNAL FLIP")
+    ml_n, ml_p = ml_engine.status()
+    ml_state = f"READY n={ml_n} P={ml_p*100:.0f}%" if ml_n >= ML_MIN_SAMPLES else f"WARMUP {ml_n}/{ML_MIN_SAMPLES}"
+    ml_filter = "ON" if ml_n >= ML_MIN_SAMPLES else "LEARNING"
+    print(f"    🤖 ONLINE ML: {ml_state} | FILTER:{ml_filter} | EV GATE")
     print(f"    🛡️ Veto Stats: Wall Veto:{_stats['wall_veto']} | BTC Breaker:{_stats['btc_breaker_veto']} | Spoof:{_stats['spoof_veto']}")
     print(f"    ⚡ Absorption Entries: {_stats['absorb_entries']} | BEP WR:{bep:.1f}%")
 
@@ -2171,7 +2279,7 @@ def print_full():
         print(f"    {'─'*62}\n    📋 Last 5:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
-            print(f"       {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
+            print(f"       {em} {t['sym']:<14} ANL:{t.get('analysis','?'):5} -> EXEC:{t['side']:5} | {t['pnl']:+.5f}U {t['hold']}s — {t['reason']} | ML:{t.get('ml_p',0.5)*100:.0f}%")
     print(f"  {'─'*72}")
 
 
@@ -2194,10 +2302,8 @@ def t_slot_filler(syms):
             if slots <= 0 or ks_check()[0]:
                 time.sleep(SLOT_FILL_INT)
                 continue
-
-            now = time.time()
             with _lock:
-                valid_syms = [s for s in syms if s not in live_positions and (s not in cooldown_list or now > cooldown_list[s])]
+                valid_syms = [s for s in syms if s not in live_positions]
 
             hot = [s for s in _hot_syms if s in valid_syms]
             mv = top_movers(valid_syms, 30)
@@ -2216,8 +2322,8 @@ def t_slot_filler(syms):
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS:
                         break
-                    sym, od, sc, sg, px, atr, regime, bias, risk_profile = r
-                    live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile)
+                    sym, od, sc, sg, px, atr, regime, bias, risk_profile, ml_prob, ml_features = r
+                    live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile, ml_prob, ml_features)
         except Exception as e:
             _log_err("t_slot_filler", e)
         time.sleep(SLOT_FILL_INT)
@@ -2231,10 +2337,8 @@ def t_rescan(syms):
             slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0]:
                 continue
-
-            now = time.time()
             with _lock:
-                valid_syms = [s for s in syms if s not in live_positions and (s not in cooldown_list or now > cooldown_list[s])]
+                valid_syms = [s for s in syms if s not in live_positions]
 
             hot = [s for s in _hot_syms if s in valid_syms]
             rest = [s for s in valid_syms if s not in hot]
@@ -2244,8 +2348,10 @@ def t_rescan(syms):
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS:
                         break
-                    sym, od, sc, sg, px, atr, regime, bias, risk_profile = r
-                    live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile)
+                    sym, od, sc, sg, px, atr, regime, bias, risk_profile, ml_prob, ml_features = r
+                    live_open(od, sc, sg, px, atr, regime, bias, sym, risk_profile, ml_prob, ml_features)
+        except queue.Empty:
+            continue
         except Exception as e:
             _log_err("t_rescan", e, cooldown=15)
 
@@ -2466,14 +2572,15 @@ def demo_preflight_account(syms):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v24.0 — LOSS TOGGLE STATE ENGINE                ║")
+    print("║  💎 BOT SCALPING v25.0 — EXACT LOSS TOGGLE + ONLINE ML ENGINE                ║")
     print("║  1. START: NORMAL (Analisa LONG->LONG | SHORT->SHORT)             ║")
     print("║  2. SL / TIME_LIMIT MINUS: TOGGLE NORMAL <-> INVERTED            ║")
     print("║  3. TP / TIME_LIMIT PROFIT: MODE TETAP                            ║")
     print("║  4. MAX POSISI: 1                                                 ║")
     print("║  5. TARGET MARGIN: $3.00 USDT | CEILING: $3.10                   ║")
     print("║  6. TANPA BAN / TANPA SIGNAL FLIP                                 ║")
-    print("║  7. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
+    print("║  7. ONLINE ML: LEARN HASIL TRADE + EV FILTER                     ║")
+    print("║  8. PRIVATE ORDER ROUTE: demo-fapi.binance.com ONLY              ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
     try:
