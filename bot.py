@@ -12,7 +12,7 @@ ATURAN ENTRY & STATE MACHINE STRATEGI:
      * Dari INVERTED berubah kembali jadi NORMAL (analisa LONG jadi LONG, SHORT jadi SHORT).
      * Terus berganti setiap kali mengalami loss.
 3. Kondisi Profit (Kena TP atau Kena TIME_LIMIT dengan profit):
-   - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif).
+   - Logika bot TIDAK BERUBAH (mempertahankan mode yang sedang aktif)..
 4. Konfigurasi:
    - MAX_POSITIONS = 1
    - MARGIN TARGET = $3.00 USDT per posisi (ceiling $3.10 setelah rounding exchange)
