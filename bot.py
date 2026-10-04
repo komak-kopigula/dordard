@@ -3,14 +3,15 @@ Bot Scalping v22.0 — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
 EXECUTION MODES:
 - DEMO_TESTNET = True  -> Mengirim order ke Binance Futures Testnet (Demo)
-- DEMO_TESTNET = False -> Mengirim order NNYATA ke Akun Real Binance Futures
+- DEMO_TESTNET = False -> Mengirim order NYATA ke Akun Real Binance Futures
 
-LOGIC FEATURES:
+FEATURES:
 - Dynamic Toggle Mode (NORMAL <-> INVERTED saat Loss)
 - MAX_POSITIONS = 1
 - ORDER_USDT = 3.0 USDT
 - LEVERAGE = 20x
-- Includes Last 5 Trades History in Dashboard
+- Dashboard Lengkap: PnL Net, ATH PnL, Best Single Trade, Worst Single Trade
+- History Last 5 dengan Jam Entry & Jam Exit
 """
 
 import sys
@@ -44,9 +45,7 @@ load_dotenv()
 # ═══════════════════════════════════════════════════════════════════════════
 #  MODE PENGATURAN AKUN (DEMO TESTNET VS REAL AKUN)
 # ═══════════════════════════════════════════════════════════════════════════
-# Set True  -> Menggunakan API Key & Secret Testnet (fapi.binancefuture.com)
-# Set False -> Menggunakan API Key & Secret REAL Binance (fapi.binance.com)
-DEMO_TESTNET = True  
+DEMO_TESTNET = True  # Set True untuk Testnet Demo, False untuk Akun Real
 
 if DEMO_TESTNET:
     api_key = os.getenv("TESTNET_API_KEY") or os.getenv("API_KEY")
@@ -108,29 +107,24 @@ REST_MIN_INTERVAL = 0.20
 REST_403_COOLDOWN = 300.0
 REST_429_COOLDOWN = 60.0
 REST_418_COOLDOWN = 900.0
-REST_RETRIES = 2
 
 # Scoring & Filter
-MIN_SCORE      = 55
-SLIPPAGE_GUARD = 0.0015
+MIN_SCORE = 55
 
 # Risk Management (ATR Multipliers)
 ATR_TP_RESTORED_MULTIPLIER = 3.5
 ATR_SL_RESTORED_MULTIPLIER = 1.8
 
-MIN_TP_PCT        = 0.025
-MAX_TP_PCT        = 0.035
-MIN_SL_PCT        = 0.015
-MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # 1 Jam 42 Menit batas maksimal hold posisi
+MIN_TP_PCT       = 0.025
+MAX_TP_PCT       = 0.035
+MIN_SL_PCT       = 0.015
+MAX_SL_PCT       = 0.025
+MAX_HOLD_SECONDS = 6120   # 1 Jam 42 Menit batas maksimal hold posisi
 
 # Microstructure & Correlation
-WALL_RATIO_THRESHOLD  = 2.5
-WALL_DEPTH_PCT        = 0.35
-WALL_PROXIMITY_PCT    = 0.005
-IMBALANCE_STRONG_BULL = 0.25
-IMBALANCE_STRONG_BEAR = -0.25
-SPOOF_DROP_THRESHOLD  = 0.40
+WALL_RATIO_THRESHOLD = 2.5
+WALL_DEPTH_PCT       = 0.35
+WALL_PROXIMITY_PCT   = 0.005
 
 BTC_CRASH_THRESHOLD  = -0.003
 BTC_PUMP_THRESHOLD   = 0.003
@@ -141,9 +135,6 @@ BTC_BREAKER_COOLDOWN = 120.0
 DAILY_LOSS   = -20.0
 CONSEC_MAX   = 15
 CONSEC_PAUSE = 10
-
-LEARNING_WINDOW       = 200
-MIN_TRADES_FOR_WEIGHT = 20
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SYMBOLS
@@ -183,36 +174,23 @@ class OrderBookEngine:
             tot_vol = bid_vol + ask_vol
             imbalance = (bid_vol - ask_vol) / (tot_vol + 1e-9)
 
-            best_bid = bids[0][0] if bids else 0.0
-            best_ask = asks[0][0] if asks else 0.0
-
             with self._lock:
                 self._cache[symbol] = {
                     "bids": bids, "asks": asks,
-                    "bid_vol": bid_vol, "ask_vol": ask_vol,
                     "imbalance": imbalance,
-                    "best_bid": best_bid, "best_ask": best_ask,
                     "ts": ts
                 }
-                self._history[symbol].append((ts, bid_vol, ask_vol, best_bid, best_ask))
         except Exception:
             pass
 
-    def get_book(self, symbol: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            return self._cache.get(symbol)
-
-    def get_imbalance(self, symbol: str) -> float:
-        book = self.get_book(symbol)
-        return book["imbalance"] if book else 0.0
-
     def check_walls(self, symbol: str, current_price: float, side: str) -> Tuple[bool, str, float, float, float]:
-        book = self.get_book(symbol)
+        with self._lock:
+            book = self._cache.get(symbol)
         if not book: return False, "NO_DATA", 0.0, 0.0, 0.0
 
         if side == "LONG":
             asks = book["asks"]
-            tot_ask = book["ask_vol"]
+            tot_ask = sum(q for _, q in asks)
             if not asks or tot_ask <= 0: return False, "OK", 0.0, 0.0, 0.0
             avg_ask = tot_ask / len(asks)
 
@@ -224,7 +202,7 @@ class OrderBookEngine:
 
         elif side == "SHORT":
             bids = book["bids"]
-            tot_bid = book["bid_vol"]
+            tot_bid = sum(q for _, q in bids)
             if not bids or tot_bid <= 0: return False, "OK", 0.0, 0.0, 0.0
             avg_bid = tot_bid / len(bids)
 
@@ -236,43 +214,22 @@ class OrderBookEngine:
 
         return False, "OK", 0.0, 0.0, 0.0
 
-    def detect_spoofing(self, symbol: str, side: str) -> Tuple[bool, str]:
-        with self._lock:
-            hist = list(self._history.get(symbol, []))
-        if len(hist) < 3: return False, ""
-        
-        curr_ts, curr_b_vol, curr_a_vol, _, _ = hist[-1]
-        for ts, b_vol, a_vol, _, _ in hist[:-1]:
-            if 0.5 <= (curr_ts - ts) <= 2.5:
-                if side == "LONG" and b_vol > 0:
-                    if curr_b_vol < b_vol * (1 - SPOOF_DROP_THRESHOLD):
-                        drop_pct = (1 - curr_b_vol / b_vol) * 100
-                        return True, f"Bid liquidity pulled ({drop_pct:.0f}% drop)"
-                elif side == "SHORT" and a_vol > 0:
-                    if curr_a_vol < a_vol * (1 - SPOOF_DROP_THRESHOLD):
-                        drop_pct = (1 - curr_a_vol / a_vol) * 100
-                        return True, f"Ask liquidity pulled ({drop_pct:.0f}% drop)"
-        return False, ""
-
 order_book = OrderBookEngine()
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MACRO BTC & TICK CORRELATION ENGINE
+#  MACRO BTC ENGINE
 # ═══════════════════════════════════════════════════════════════════════════
 
 class BTCMacroEngine:
     def __init__(self):
         self.tick_history = deque(maxlen=150)
-        self.breaker = {"active": False, "type": "NONE", "until": 0.0, "delta": 0.0, "trigger_ts": 0.0}
-        self.last_price = 0.0
+        self.breaker = {"active": False, "type": "NONE", "until": 0.0}
         self.lock = threading.Lock()
 
     def update_tick(self, price: float, ts: float = None):
         if ts is None: ts = time.time()
         with self.lock:
-            self.last_price = price
             self.tick_history.append((ts, price))
-
             cutoff = ts - BTC_WINDOW_SEC
             baseline_price = None
             for t_ts, t_px in self.tick_history:
@@ -283,17 +240,9 @@ class BTCMacroEngine:
             if baseline_price and baseline_price > 0:
                 delta = (price - baseline_price) / baseline_price
                 if delta <= BTC_CRASH_THRESHOLD and not (self.breaker["active"] and self.breaker["type"] == "CRASH"):
-                    self.breaker = {
-                        "active": True, "type": "CRASH", "until": ts + BTC_BREAKER_COOLDOWN,
-                        "delta": delta, "trigger_ts": ts
-                    }
-                    print(f"\n  🚨 [BTC FLASH CRASH DETECTED] Drop: {delta*100:+.2f}% | Altcoin LONGs LOCKED!")
+                    self.breaker = {"active": True, "type": "CRASH", "until": ts + BTC_BREAKER_COOLDOWN}
                 elif delta >= BTC_PUMP_THRESHOLD and not (self.breaker["active"] and self.breaker["type"] == "PUMP"):
-                    self.breaker = {
-                        "active": True, "type": "PUMP", "until": ts + BTC_BREAKER_COOLDOWN,
-                        "delta": delta, "trigger_ts": ts
-                    }
-                    print(f"\n  🚀 [BTC FLASH PUMP DETECTED] Surge: {delta*100:+.2f}% | Altcoin SHORTs LOCKED!")
+                    self.breaker = {"active": True, "type": "PUMP", "until": ts + BTC_BREAKER_COOLDOWN}
 
     def check_veto(self, side: str, now: float = None) -> Tuple[bool, str]:
         if now is None: now = time.time()
@@ -301,9 +250,8 @@ class BTCMacroEngine:
             if self.breaker["active"]:
                 if now < self.breaker["until"]:
                     rem = self.breaker["until"] - now
-                    b_type = self.breaker["type"]
-                    if b_type == "CRASH" and side == "LONG": return True, f"BTC Flash Crash ({rem:.0f}s left)"
-                    elif b_type == "PUMP" and side == "SHORT": return True, f"BTC Flash Pump ({rem:.0f}s left)"
+                    if self.breaker["type"] == "CRASH" and side == "LONG": return True, f"BTC Crash Breaker ({rem:.0f}s)"
+                    elif self.breaker["type"] == "PUMP" and side == "SHORT": return True, f"BTC Pump Breaker ({rem:.0f}s)"
                 else:
                     self.breaker["active"] = False
                     self.breaker["type"] = "NONE"
@@ -315,32 +263,6 @@ _btc_macro = {"regime": "UNKNOWN"}
 # ═══════════════════════════════════════════════════════════════════════════
 #  RISK & REGIME ENGINES
 # ═══════════════════════════════════════════════════════════════════════════
-
-class AbsorptionDetector:
-    @staticmethod
-    def detect(df: pd.DataFrame) -> Tuple[bool, bool, str]:
-        if df is None or len(df) < 25: return False, False, ""
-        row = df.iloc[-2]
-        
-        vol_spike = row.get("vr", 1.0) >= 1.4
-        rng = row.get("rng", 1.0)
-        low, high, close = row.get("low", 0.0), row.get("high", 0.0), row.get("close", 0.0)
-        delta_ratio = row.get("delta_ratio", 0.0)
-        buy_ratio = row.get("br", 0.5)
-        lw_ratio = row.get("lower_wick_ratio", 0.0)
-        uw_ratio = row.get("upper_wick_ratio", 0.0)
-
-        heavy_seller = (delta_ratio < -0.20) or (buy_ratio < 0.40)
-        wick_bull = lw_ratio >= 0.38
-        close_held_bull = close >= (low + 0.45 * rng)
-        bull_absorb = vol_spike and heavy_seller and (wick_bull or close_held_bull)
-
-        heavy_buyer = (delta_ratio > 0.20) or (buy_ratio > 0.60)
-        wick_bear = uw_ratio >= 0.38
-        close_held_bear = close <= (high - 0.45 * rng)
-        bear_absorb = vol_spike and heavy_buyer and (wick_bear or close_held_bear)
-
-        return bull_absorb, bear_absorb, ""
 
 class DynamicRiskManager:
     @staticmethod
@@ -359,48 +281,21 @@ class DynamicRiskManager:
         return {"tp_pct": tp_pct, "sl_pct": sl_pct, "tp_price": tp_price, "sl_price": sl_price}
 
 class MarketRegime:
-    REGIME_TRENDING_BULL = "TRENDING_BULL"
-    REGIME_TRENDING_BEAR = "TRENDING_BEAR"
-    REGIME_RANGE         = "RANGE"
-    REGIME_VOLATILE      = "VOLATILE"
-    REGIME_EXHAUSTION    = "EXHAUSTION"
-
     @staticmethod
     def detect(df: pd.DataFrame) -> Tuple[str, float, float]:
-        if df is None or len(df) < 55: return MarketRegime.REGIME_RANGE, 0, 0
-        row, prev = df.iloc[-2], df.iloc[-3]
+        if df is None or len(df) < 55: return "RANGE", 0, 0
+        row = df.iloc[-2]
         close = row["close"]
         e5, e9, e21, e50 = row["e5"], row["e9"], row["e21"], row["e50"]
         adx = row["adx"]
         bull_stack = close > e5 > e9 > e21 > e50
         bear_stack = close < e5 < e9 < e21 < e50
 
-        if adx > 35 and bull_stack: return MarketRegime.REGIME_TRENDING_BULL, adx, 1.0
-        elif adx > 35 and bear_stack: return MarketRegime.REGIME_TRENDING_BEAR, adx, -1.0
-        else: return MarketRegime.REGIME_RANGE, 30, 0
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SCORING ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SignalWeights:
-    def __init__(self):
-        self.weights = {
-            "ema_bull_stack": 30, "mom_strong": 25, "macd_cross_up": 22,
-            "ema_bear_stack": 30, "mom_strong_neg": 25, "macd_cross_down": 22,
-        }
-        self.history = defaultdict(list)
-
-    def record_outcome(self, signals: List[str], won: bool):
-        pass
-
-    def get_adjusted_weight(self, signal_name: str) -> float:
-        return self.weights.get(signal_name, 15)
+        if adx > 35 and bull_stack: return "TRENDING_BULL", adx, 1.0
+        elif adx > 35 and bear_stack: return "TRENDING_BEAR", adx, -1.0
+        else: return "RANGE", 30, 0
 
 class SignalScorer:
-    def __init__(self, signal_weights: SignalWeights):
-        self.weights = signal_weights
-
     def get_signal(self, df: pd.DataFrame, symbol: str = None) -> Tuple[Optional[str], int, List[str], float, str, float]:
         if df is None or len(df) < 55: return None, 0, [], 0.0, "UNKNOWN", 0.0
         
@@ -440,37 +335,33 @@ _ticker_ts       = 0
 _lock            = threading.Lock()
 _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
-_hot_syms        = deque(maxlen=30)
 
 _ws_mark_price   = {}
 _kline_cache     = {}
 _kline_lock      = threading.Lock()
-_ws_ticker_cache = {}
-_ws_ticker_ts    = 0
-_ws_last_msg_ts  = time.time()
 MARKPRICE_FRESH_SEC = 10
 
 _macro = {"btc": "UNKNOWN"}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
+
+# TRACKING REKAP PNL LENGKAP
 _stats = {
-    "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
+    "trades": 0, "wins": 0, "losses": 0, 
+    "pnl": 0.0, "ath_pnl": 0.0,
+    "best": 0.0, "worst": 0.0, # Best & Worst Single Trade
     "hard_sl": 0, "tp_exit": 0, "time_limit_exit": 0,
-    "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0,
-    "hist": deque(maxlen=200), "start": time.time(),
+    "start": time.time(),
 }
 
 is_logic_inverted = False 
 
 live_positions = {}
-trade_log      = []
-signal_weights = SignalWeights()
-scorer         = SignalScorer(signal_weights)
+trade_log      = [] # Menyimpan riwayat transaksi lengkap
+scorer         = SignalScorer()
 
 _last_err_print = defaultdict(float)
 _rest_lock = threading.Lock()
 _rest_last_ts = 0.0
-_rest_block_until = 0.0
-_rest_price_cache = {}
 
 def _log_err(tag, e, cooldown=10):
     now = time.time()
@@ -478,13 +369,12 @@ def _log_err(tag, e, cooldown=10):
         print(f"  ⚠️ [{tag}] {type(e).__name__}: {e}")
         _last_err_print[tag] = now
 
-def _rest_call(tag, fn, *args, retries=1, **kwargs):
+def _rest_call(tag, fn, *args, **kwargs):
     global _rest_last_ts
     with _rest_lock:
         gap = time.time() - _rest_last_ts
         if gap < REST_MIN_INTERVAL: time.sleep(REST_MIN_INTERVAL - gap)
         _rest_last_ts = time.time()
-
     return fn(*args, **kwargs)
 
 def get_precision(symbol):
@@ -496,8 +386,7 @@ def get_precision(symbol):
                 prec = int(s['quantityPrecision'])
                 _precision_cache[symbol] = prec
                 return prec
-    except Exception:
-        pass
+    except Exception: pass
     return 2
 
 def qty(symbol, price):
@@ -512,19 +401,7 @@ def price_live(symbol):
     try:
         px = float(_rest_call(f"price_{symbol}", client.futures_symbol_ticker, symbol=symbol)["price"])
         return px
-    except Exception:
-        return 0.0
-
-def tickers_all():
-    global _ticker_cache, _ticker_ts
-    now = time.time()
-    if _ws_ticker_cache and (now - _ws_ticker_ts) < 15: return _ws_ticker_cache
-    try:
-        raw = _rest_call("futures_ticker", client.futures_ticker)
-        _ticker_cache = {t["symbol"]: {"pct": float(t["priceChangePercent"]), "vol": float(t["quoteVolume"]), "last": float(t["lastPrice"])} for t in raw}
-        _ticker_ts = now
-    except Exception: pass
-    return _ticker_cache
+    except Exception: return 0.0
 
 def _compute_indicators(df):
     close = df["close"]
@@ -537,18 +414,9 @@ def _compute_indicators(df):
     df["e50"] = ta.trend.EMAIndicator(close, 50).ema_indicator()
     df["atr"] = ta.volatility.AverageTrueRange(high, low, close, 14).average_true_range()
     df["adx"] = ta.trend.ADXIndicator(high, low, close, 14).adx()
-    
-    df["vm"]  = volume.rolling(20).mean()
-    df["vr"]  = volume / df["vm"].replace(0, 1e-9)
-    df["delta_ratio"] = 0.0
-    df["br"] = 0.5
-    df["rng"] = (high - low).replace(0, 1e-9)
-    df["lower_wick_ratio"] = 0.0
-    df["upper_wick_ratio"] = 0.0
     return df
 
-def run_ta(df):
-    return _compute_indicators(df)
+def run_ta(df): return _compute_indicators(df)
 
 def _bootstrap_klines(symbol, interval, limit=100):
     try:
@@ -558,26 +426,19 @@ def _bootstrap_klines(symbol, interval, limit=100):
         df = _compute_indicators(df)
         with _kline_lock: _kline_cache[symbol] = df
         return df
-    except Exception:
-        return None
+    except Exception: return None
 
 def ohlcv(symbol, interval, limit=100):
-    with _kline_lock:
-        df = _kline_cache.get(symbol)
+    with _kline_lock: df = _kline_cache.get(symbol)
     if df is not None: return df
     return _bootstrap_klines(symbol, interval, limit)
 
-def ks_check():
-    return False, ""
-
 def set_leverage_safe(symbol, leverage=LEVERAGE):
-    try:
-        _rest_call(f"leverage_{symbol}", client.futures_change_leverage, symbol=symbol, leverage=leverage)
-    except Exception as e:
-        _log_err(f"leverage_{symbol}", e)
+    try: _rest_call(f"leverage_{symbol}", client.futures_change_leverage, symbol=symbol, leverage=leverage)
+    except Exception as e: _log_err(f"leverage_{symbol}", e)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  BINANCE ORDER EXECUTION (DEMO / REAL)
+#  ORDER EXECUTION & POSITION TRACKING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
@@ -599,24 +460,20 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # Set Leverage di Akun Binance Testnet/Real
     set_leverage_safe(sym, LEVERAGE)
 
-    # 🚀 EXECUTE ORDER KE BINANCE FUTURES
     order_side = "BUY" if execution_side == "LONG" else "SELL"
+    entry_ts = time.time()
     try:
         order_res = _rest_call(
             f"open_{sym}",
             client.futures_create_order,
-            symbol=sym,
-            side=order_side,
-            type="MARKET",
-            quantity=q_val
+            symbol=sym, side=order_side, type="MARKET", quantity=q_val
         )
         entry_price = float(order_res.get("avgPrice", price))
         if entry_price == 0: entry_price = price
     except Exception as e:
-        print(f"❌ [ORDER ERROR] Gagal Membuka Posisi di Binance ({sym}): {e}")
+        print(f"❌ [ORDER ERROR] Gagal Membuka Posisi ({sym}): {e}")
         with _lock: live_positions.pop(sym, None)
         return
 
@@ -626,10 +483,10 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "side": execution_side,
         "entry": entry_price,
         "qty": q_val,
-        "open_time": time.time(),
+        "open_time": entry_ts,
+        "open_time_str": time.strftime("%H:%M:%S", time.localtime(entry_ts)), # Jam Entry
         "tp_price": risk["tp_price"],
         "sl_price": risk["sl_price"],
-        "order_id": order_res.get("orderId"),
     }
 
     with _lock: live_positions[sym] = pos
@@ -637,8 +494,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
     env_str = "DEMO TESTNET" if DEMO_TESTNET else "REAL ACCOUNT"
     print(
-        f"\n  🚀 [{env_str} ORDER] {sym} EXEC:{execution_side} (Mode:{mode_str}) @{entry_price:.6g} | "
-        f"QTY:{q_val} | TP:{risk['tp_price']:.6g} | SL:{risk['sl_price']:.6g}"
+        f"\n  🚀 [{env_str}] {sym} EXEC:{execution_side} (Mode:{mode_str}) @{entry_price:.6g} | "
+        f"Jam Entry: {pos['open_time_str']} | QTY:{q_val}"
     )
 
     _stats["trades"] += 1
@@ -649,27 +506,23 @@ def live_close(sym, reason, price=None):
     with _lock: pos = live_positions.pop(sym, None)
     if pos is None or pos.get("_r"): return
 
+    exit_ts = time.time()
+    exit_time_str = time.strftime("%H:%M:%S", time.localtime(exit_ts)) # Jam Exit
     side = pos["side"]
     entry = pos["entry"]
     q_val = pos["qty"]
 
-    # 🚀 CLOSE ORDER DI BINANCE FUTURES
     close_side = "SELL" if side == "LONG" else "BUY"
     try:
         close_res = _rest_call(
             f"close_{sym}",
             client.futures_create_order,
-            symbol=sym,
-            side=close_side,
-            type="MARKET",
-            quantity=q_val,
-            reduceOnly=True
+            symbol=sym, side=close_side, type="MARKET", quantity=q_val, reduceOnly=True
         )
         exit_price = float(close_res.get("avgPrice", price or 0))
         if exit_price == 0: exit_price = price_live(sym)
     except Exception as e:
-        print(f"❌ [CLOSE ERROR] Gagal Menutup Posisi di Binance ({sym}): {e}")
-        # Masukkan kembali ke tracking jika gagal close
+        print(f"❌ [CLOSE ERROR] Gagal Menutup Posisi ({sym}): {e}")
         with _lock: live_positions[sym] = pos
         return
 
@@ -690,28 +543,40 @@ def live_close(sym, reason, price=None):
 
     print(
         f"  {e_icon} [ORDER CLOSED] {sym} {side} CLOSE — {reason} | "
-        f"{entry:.6g}→{exit_price:.6g} | PnL:{pnl:+.5f}U"
+        f"{entry:.6g}→{exit_price:.6g} | Jam Entry: {pos.get('open_time_str', 'N/A')} | Jam Exit: {exit_time_str} | PnL:{pnl:+.5f}U"
     )
 
+    # UPDATE SUMMARY REKAP PNL
     _stats["pnl"] += pnl
-    if _stats["pnl"] > _stats["ath_pnl"]: _stats["ath_pnl"] = _stats["pnl"]
+    if _stats["pnl"] > _stats["ath_pnl"]: 
+        _stats["ath_pnl"] = _stats["pnl"]
 
-    if won:
-        _stats["wins"] += 1
-        if pnl > _stats["best"]: _stats["best"] = pnl
+    # REKAP PROFIT TERTINGGI & LOSS TERTINGGI (BEST/WORST SINGLE TRADE)
+    if _stats["trades"] == 1:
+        _stats["best"] = pnl
+        _stats["worst"] = pnl
     else:
-        _stats["losses"] += 1
+        if pnl > _stats["best"]: _stats["best"] = pnl
         if pnl < _stats["worst"]: _stats["worst"] = pnl
+
+    if won: _stats["wins"] += 1
+    else: _stats["losses"] += 1
 
     if reason == "SL": _stats["hard_sl"] += 1
     elif reason == "TP": _stats["tp_exit"] += 1
     elif reason == "TIME_LIMIT": _stats["time_limit_exit"] += 1
 
-    # DASHBOARD HISTORY RIWAYAT 5 TRADES
+    # SIMPAN KE TRADE LOG DENGAN JAM ENTRY & JAM EXIT
     trade_log.append({
-        "sym": sym, "side": side, "entry": round(entry, 7),
-        "exit": round(exit_price, 7), "pnl": round(pnl, 5),
-        "reason": reason, "hold": int(time.time() - pos["open_time"]),
+        "sym": sym, 
+        "side": side, 
+        "entry": round(entry, 7),
+        "exit": round(exit_price, 7), 
+        "pnl": round(pnl, 5),
+        "reason": reason, 
+        "hold": int(exit_ts - pos["open_time"]),
+        "entry_time": pos.get("open_time_str", "N/A"),
+        "exit_time": exit_time_str
     })
 
     _rescan_q.put(1)
@@ -739,7 +604,7 @@ def monitor_positions():
             continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREADS
+#  SCANNER THREADS & DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -762,8 +627,7 @@ def scan_one(sym):
 
         risk_profile = DynamicRiskManager.calculate_levels(px_live, execution_side, atr_val)
         return (sym, orig_direction, score, sigs, px_live, atr_val, regime, bias, risk_profile)
-    except Exception:
-        return None
+    except Exception: return None
 
 def scan_batch(syms):
     res = []
@@ -786,13 +650,15 @@ def print_full():
     print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD [{env_str}]")
     print(f"    🎯 Mode Logika: {mode_str} | Trades: {n} | WR: {wr:.0f}% (W:{_stats['wins']} L:{_stats['losses']})")
     print(f"    💰 PnL Net: {pnl:+.5f} USDT | ATH PnL: {_stats['ath_pnl']:+.5f} USDT")
+    print(f"    🏆 Best Single Trade: {_stats['best']:+.5f} USDT | 🔻 Worst Single Trade: {_stats['worst']:+.5f} USDT")
     print(f"    📈 Exits -> TP: {_stats['tp_exit']} | SL: {_stats['hard_sl']} | TimeLimit: {_stats['time_limit_exit']}")
 
+    # RIWAYAT 5 KOIN TERAKHIR LENGKAP DENGAN JAM ENTRY DAN EXIT
     if trade_log:
-        print(f"    {'─'*62}\n    📋 Last 5:")
+        print(f"    {'─'*62}\n    📋 Last 5 Trades History:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] >= 0 else "🔴"
-            print(f"        {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
+            print(f"        {em} [{t['entry_time']} -> {t['exit_time']}] {t['sym']:<12} {t['side']:<5} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -863,7 +729,7 @@ def run_bot():
     print("║  1. Mode Awal: NORMAL (LONG->LONG, SHORT->SHORT)                   ║")
     print("║  2. Jika Loss (SL/TimeLimit < 0) -> TOGGLE Invert/Normal           ║")
     print("║  3. Margin = $3.0 | Leverage = 20x | Max Position = 1              ║")
-    print("║  4. Real Order Execution ke Binance Futures                        ║")
+    print("║  4. Live Dashboard: PnL, ATH, Best/Worst Single Trade & Jam Entry  ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
