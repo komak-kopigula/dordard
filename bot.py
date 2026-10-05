@@ -1,13 +1,14 @@
 """
-Bot Scalping v22.0 LIVE/DEMO — INSTITUTIONAL QUANT ENGINE (Binance Futures)
+Bot Scalping v22.0 DEMO — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
-STRICT SIDEWAY & VOLUME FILTER + MAKASSAR TIMEZONE (WITA):
+DIRECTIONAL CONSECUTIVE LOSS PROTECTION & STRICT SIDEWAY FILTER:
 - Volume Filter: Wajib Volume Ratio (VR) >= 0.85 & ADX >= 20 (Cegah Entry Sideway)
-- Volatility Filter: ATR % wajib cukup untuk pergerakan harga.
 - Dynamic Logic Toggle Mode: Normal <-> Inverted saat Loss.
-- Real-time Metrics: ATH PnL, Best Single Win, Worst Single Loss.
-- Last 5 Trades History dengan Timestamp Entry & Exit (Zona Waktu WITA / Makassar UTC+8).
-- MAX_POSITIONS = 1 | ORDER_USDT = 2.5 USDT.
+- Same-Side Retry Guard: Jika posisi sebelumnya rugi (SL/TimeLimit < 0) pada arah X (LONG/SHORT),
+  posisi berikutnya yang berarah X wajib meloloskan Filter Ketat (Minimal Score +12 & ADX > 25).
+  Jika tren berbalik arah ke Y (berlawanan), filter tambahan tidak diaktifkan.
+- Real-time Metrics & Timestamp WITA (Makassar UTC+8).
+- MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 """
 
 import sys
@@ -34,7 +35,6 @@ from typing import Optional, Tuple, List, Dict, Any
 
 from dotenv import load_dotenv
 from binance.client import Client
-from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from binance import ThreadedWebsocketManager
 import ta
 
@@ -42,19 +42,14 @@ load_dotenv()
 api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  TOGGLE AKUN REAL VS DEMO BINANCE (ENTRY BENERAN DUA-DUANYA)
-# ═══════════════════════════════════════════════════════════════════════════
-REAL_ACCOUNT = False  # True = Akun Real Binance | False = Akun Demo Testnet Binance
-
-if REAL_ACCOUNT:
+try:
     client = Client(api_key, api_secret)
-    client.FUTURES_URL = "https://fapi.binance.com/fapi"
-    ACCOUNT_MODE_STR = "REAL ACCOUNT (MAINNET)"
-else:
-    client = Client(api_key, api_secret, testnet=True)
-    client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-    ACCOUNT_MODE_STR = "DEMO ACCOUNT (TESTNET)"
+except Exception:
+    client = Client(api_key, api_secret)
+
+PAPER_TRADING = True
+BINANCE_DEMO = False
+client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
 WS_MAX_QUEUE_SIZE = 2000
 DEPTH_SOCKET_CHUNK = 8
@@ -65,9 +60,6 @@ WITA_TZ = timezone(timedelta(hours=8))
 
 def _create_twm():
     kwargs = {"api_key": api_key, "api_secret": api_secret}
-    if not REAL_ACCOUNT:
-        kwargs["testnet"] = True
-        
     try:
         params = inspect.signature(ThreadedWebsocketManager.__init__).parameters
         if "max_queue_size" in params:
@@ -90,7 +82,7 @@ twm = _create_twm()
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 20
-ORDER_USDT    = 2.5   # Diubah menjadi 2.5 USDT sesuai permintaan
+ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
 # Strict Volume & Sideway Filters
@@ -113,7 +105,8 @@ REST_418_COOLDOWN = 900.0
 REST_RETRIES = 2
 
 # Scoring & Risk
-MIN_SCORE                  = 58   # Menaikkan batas minimal skor sinyal
+MIN_SCORE                  = 58   # Skor minimal sinyal normal
+SAME_SIDE_EXTRA_SCORE      = 12   # Tambahan skor minimal jika mau entry di arah yang baru saja rugi (58+12 = 70)
 ATR_TP_RESTORED_MULTIPLIER = 3.5
 ATR_SL_RESTORED_MULTIPLIER = 1.8
 
@@ -651,12 +644,15 @@ _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
     "hard_sl": 0, "tp_exit": 0, "time_limit_exit": 0, "regime_block": 0,
     "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
-    "low_vol_veto": 0,
+    "low_vol_veto": 0, "same_side_veto": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
 # Variable Toggle Invert Logika
 is_logic_inverted = False 
+
+# Variable Tracker Arah Eksekusi yang Terakhir Kali Mengalami Loss (None / "LONG" / "SHORT")
+_last_failed_execution_side = None
 
 live_positions = {}
 cooldown_list  = {}
@@ -723,19 +719,7 @@ def _rest_call(tag, fn, *args, retries=1, **kwargs):
     if last_exc is not None: raise last_exc
     raise RuntimeError(f"REST call failed: {tag}")
 
-def get_precision(symbol: str) -> int:
-    if symbol in _precision_cache:
-        return _precision_cache[symbol]
-    try:
-        info = _rest_call("get_precision_info", client.futures_exchange_info, retries=1)
-        for s in info.get("symbols", []):
-            if s["symbol"] == symbol:
-                prec = s.get("quantityPrecision", 2)
-                _precision_cache[symbol] = prec
-                return prec
-    except Exception:
-        pass
-    return 2
+get_precision = lambda sym: 2
 
 def qty(symbol, price):
     raw = (ORDER_USDT * LEVERAGE) / price
@@ -909,32 +893,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  EKSEKUSI RIIL ORDER BINANCE (REAL ATAU DEMO ACC)
-    # ═══════════════════════════════════════════════════════════════════════════
-    try:
-        # 1. Atur Leverage di Binance
-        _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
-        
-        # 2. Kirim Market Order
-        order_side = SIDE_BUY if execution_side == "LONG" else SIDE_SELL
-        real_order = _rest_call(
-            f"open_order_{sym}",
-            client.futures_create_order,
-            symbol=sym,
-            side=order_side,
-            type=ORDER_TYPE_MARKET,
-            quantity=q_val
-        )
-        # Ambil harga rata-rata eksekusi riil dari Binance jika ada
-        if isinstance(real_order, dict) and "avgPrice" in real_order and float(real_order["avgPrice"]) > 0:
-            price = float(real_order["avgPrice"])
-    except Exception as e:
-        _log_err(f"binance_open_failed_{sym}", e)
-        with _lock: live_positions.pop(sym, None)
-        return
-
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
+
     open_ts = time.time()
     pos = {
         "side": execution_side,
@@ -953,6 +913,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "tp_price": risk["tp_price"],
         "sl_price": risk["sl_price"],
         "peak_price": price,
+        "paper": True,
     }
 
     with _lock:
@@ -962,15 +923,15 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
 
     print(
-        f"\n  {d} [ENTRY BINANCE] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{mode_str}) @{price:.6g} | "
-        f"QTY:{q_val:.8g} | Margin:${ORDER_USDT} | TP:{risk['tp_pct']*100:.2f}% | SL:{risk['sl_pct']*100:.2f}% | In:{pos['open_time_wita']} WITA"
+        f"\n  {d} [PAPER TRADE] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{mode_str}) @{price:.6g} | "
+        f"QTY:{q_val:.8g} | TP:{risk['tp_pct']*100:.2f}% | SL:{risk['sl_pct']*100:.2f}% | In:{pos['open_time_wita']} WITA"
     )
 
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs): _stats["absorb_entries"] += 1
 
 def live_close(sym, reason, price=None):
-    global is_logic_inverted
+    global is_logic_inverted, _last_failed_execution_side
 
     with _lock:
         pos = live_positions.pop(sym, None)
@@ -989,23 +950,6 @@ def live_close(sym, reason, price=None):
     entry = pos["entry"]
     q_val = pos["qty"]
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  EKSEKUSI RIIL CLOSE POSITION BINANCE (REAL ATAU DEMO ACC)
-    # ═══════════════════════════════════════════════════════════════════════════
-    try:
-        close_side = SIDE_SELL if side == "LONG" else SIDE_BUY
-        _rest_call(
-            f"close_order_{sym}",
-            client.futures_create_order,
-            symbol=sym,
-            side=close_side,
-            type=ORDER_TYPE_MARKET,
-            quantity=q_val,
-            reduceOnly=True
-        )
-    except Exception as e:
-        _log_err(f"binance_close_failed_{sym}", e)
-
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
     total_fee = (entry * q_val + price * q_val) * fee_rate
@@ -1021,18 +965,20 @@ def live_close(sym, reason, price=None):
     open_wita = pos.get("open_time_wita", datetime.fromtimestamp(pos["open_time"], tz=WITA_TZ).strftime("%H:%M:%S"))
 
     # ═══════════════════════════════════════════════════════════════════════════
-    #  LOGIKA TOGGLE INVERT / NORMAL MULTI-LOSS
+    #  LOGIKA TOGGLE INVERT / NORMAL & SAME-SIDE LOSS TRACKER
     # ═══════════════════════════════════════════════════════════════════════════
     if not won:  # Loss (SL atau TIME_LIMIT pnl < 0)
         is_logic_inverted = not is_logic_inverted  # Toggle mode
+        _last_failed_execution_side = side          # Catat arah eksekusi yang baru saja rugi
         next_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        print(f"  🔄 [LOGIC TOGGLE] Posisi MINUS/LOSS ({pnl:+.4f}U)! Logika Bot Berganti Mode ke: {next_mode}")
+        print(f"  🔄 [LOGIC TOGGLE] Posisi {side} MINUS ({pnl:+.4f}U)! Mode Berubah ke: {next_mode} | Same-Side Guard Locked for {side}")
     else:
+        _last_failed_execution_side = None          # Reset tracker jika profit
         current_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        print(f"  ✅ [LOGIC STABLE] Posisi PROFIT ({pnl:+.4f}U)! Logika Tetap Bertahan di Mode: {current_mode}")
+        print(f"  ✅ [LOGIC STABLE] Posisi {side} PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}")
 
     print(
-        f"  {e_icon} [EXIT BINANCE] {sym} {side} CLOSE — {reason} | "
+        f"  {e_icon} [PAPER EXIT] {sym} {side} CLOSE — {reason} | "
         f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U | Out:{close_wita} WITA"
     )
 
@@ -1064,7 +1010,6 @@ def live_close(sym, reason, price=None):
     elif reason == "TP": _stats["tp_exit"] += 1
     elif reason == "TIME_LIMIT": _stats["time_limit_exit"] += 1
 
-    # CATAT RIWAYAT TRADING LENGKAP DENGAN TIMESTAMP MAKASSAR (WITA)
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7),
         "exit": round(price, 7), "pnl": round(pnl, 5),
@@ -1102,7 +1047,7 @@ def monitor_positions():
             continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD & STRICT VOLUME FILTERS
+#  SCANNER THREAD & STRICT FILTERS (WITH SAME-SIDE RETRY GUARD)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -1123,20 +1068,37 @@ def scan_one(sym):
         # ── FILTER 1: Strict Volume & Sideway Guard ─────────────────────────
         if vr_val < MIN_VOLUME_RATIO:
             _stats["low_vol_veto"] += 1
-            return None  # Volume terlalu tipis / sepi
+            return None  # Volume terlalu tipis
         if adx_val < MIN_ADX_TREND:
             _stats["low_vol_veto"] += 1
-            return None  # Market dalam kondisi mati / sideway tanpa tren
+            return None  # Market sideway tanpa tren
         if (atr_val / px_candle) < MIN_ATR_PCT:
             _stats["low_vol_veto"] += 1
-            return None  # Volatilitas terlalu rendah untuk scalping
+            return None  # Volatilitas terlalu rendah
 
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
             return None
 
-        # Evaluasi Arah Aktual Menggunakan Status Toggle
+        # Evaluasi Arah Eksekusi Aktual Berdasarkan Mode Active
         execution_side = ("SHORT" if orig_direction == "LONG" else "LONG") if is_logic_inverted else orig_direction
+
+        # ── FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD ─────────────────────
+        # Jika eksekusi baru ini mempunya arah SAMA dengan posisi terakhir yang rugi,
+        # aktifkan Filter Tambahan Ketat agar tidak rugi berturut-turut pada arah yang sama.
+        if _last_failed_execution_side is not None and execution_side == _last_failed_execution_side:
+            required_score = MIN_SCORE + SAME_SIDE_EXTRA_SCORE # Butuh skor minimal 70
+            
+            # Pengecekan konfirmasi tambahan:
+            # 1. Skor Sinyal harus sangat tinggi (>= 70)
+            # 2. ADX harus > 25 (Tren sangat jelas)
+            # 3. Momentum candle 5m (m5) harus searah dengan eksekusi
+            m5_val = last_row.get("m5", 0.0)
+            trend_aligned = (execution_side == "LONG" and m5_val > 0.001) or (execution_side == "SHORT" and m5_val < -0.001)
+
+            if score < required_score or adx_val < 25.0 or not trend_aligned:
+                _stats["same_side_veto"] += 1
+                return None  # VETO: Gagal meloloskan filter tambahan untuk retry arah yang sama
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1188,8 +1150,9 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
-    print(f"        ┌ [{ACCOUNT_MODE_STR} - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U")
-    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']}")
+    failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
+    print(f"       ┌ [PAPER ENGINE v22 - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -1197,13 +1160,14 @@ def print_full():
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
+    failed_str = f" [SAME-SIDE GUARD ACTIVE: {_last_failed_execution_side}]" if _last_failed_execution_side else ""
     
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({ACCOUNT_MODE_STR} | MODE LOGIKA: {mode_str}) [{now_wita}]")
+    print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD (MODE LOGIKA: {mode_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
-    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']}")
+    print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
     # RIWAYAT 5 KOIN/TOKEN TERAKHIR DENGAN JAM ENTER/EXIT ZONA MAKASSAR (WITA)
     if trade_log:
@@ -1352,19 +1316,20 @@ def handle_depth_multiplex(msg):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print(f"║  💎 BOT SCALPING v22.0 — MODE: {ACCOUNT_MODE_STR:<27} ║")
+    print("║  💎 BOT SCALPING v22.0 LIVE — DIRECTIONAL ANTI-REPEAT PROTECTION   ║")
     print("║  1. Mode Awal: NORMAL (LONG->LONG, SHORT->SHORT)                   ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
     print("║  3. Jika Loss (SL/TimeLimit < 0) -> TOGGLE Invert/Normal           ║")
-    print(f"║  4. Margin = ${ORDER_USDT} | Max Position = {MAX_POSITIONS} | Real Binance Execution    ║")
-    print("║  5. Real-time Metrics & Timestamp Entry/Exit Zona Makassar (WITA)  ║")
+    print("║  4. Directional Loss Guard: Jika mau Retry di arah eksekusi yang   ║")
+    print("║     sama saat baru loss, Wajib Skor >= 70, ADX > 25 & Trend Strong.║")
+    print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
         info = _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)
         valid = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
     except Exception as e:
-        raise RuntimeError(f"Gagal membaca exchangeInfo dari Binance: {e}")
+        raise RuntimeError(f"Gagal membaca exchangeInfo: {e}")
 
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
 
@@ -1394,12 +1359,13 @@ def run_bot():
         slots = MAX_POSITIONS - len(live_positions)
         mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
         now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S")
+        guard_status = f" | Guard:[{_last_failed_execution_side}]" if _last_failed_execution_side else ""
         print(f"\n{'═'*68}")
-        print(f"  #{cycle} {now_wita} WITA | [{ACCOUNT_MODE_STR}] BTC_5M:{_macro['btc']} Mode:[{mode_str}] ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
-        else: print(f"  🔍 Slot Kosong — Scanning Signal (Filter Active, Mode: {mode_str})...")
+        else: print(f"  🔍 Slot Kosong — Scanning Signal (Mode: {mode_str})...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
