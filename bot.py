@@ -1,13 +1,10 @@
 """
-Bot Scalping v22.0 DEMO — INSTITUTIONAL QUANT ENGINE (Binance Futures)
+Bot Scalping v22.2 DEMO (ENHANCED ROTATION) — INSTITUTIONAL QUANT ENGINE
 ====================================================================
-DIRECTIONAL CONSECUTIVE LOSS PROTECTION & STRICT SIDEWAY FILTER:
-- Volume Filter: Wajib Volume Ratio (VR) >= 0.85 & ADX >= 20 (Cegah Entry Sideway)
-- Dynamic Logic Toggle Mode: Normal <-> Inverted saat Loss.
-- Same-Side Retry Guard: Jika posisi sebelumnya rugi (SL/TimeLimit < 0) pada arah X (LONG/SHORT),
-  posisi berikutnya yang berarah X wajib meloloskan Filter Ketat (Minimal Score +12 & ADX > 25).
-  Jika tren berbalik arah ke Y (berlawanan), filter tambahan tidak diaktifkan.
-- Real-time Metrics & Timestamp WITA (Makassar UTC+8).
+ENHANCED FEATURE:
+- Dynamic Symbol Rotation: Mencegah bot hanya stuck di 1 koin (misal XRP)
+  dengan memberikan Cooldown khusus koin setelah exit & merotasi antrean scan.
+- Inverted Direction Lock & Strict Sideway Filters.
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 """
 
@@ -25,6 +22,7 @@ import inspect
 import math
 import threading
 import queue
+import random
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
@@ -85,6 +83,9 @@ LEVERAGE      = 20
 ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
+# ROTATION SYSTEM PARAMETERS
+COOLDOWN_PER_SYMBOL = 600.0  # Cooldown 10 menit untuk koin yang baru saja exit agar koin lain kebagian slot
+
 # Strict Volume & Sideway Filters
 MIN_VOLUME_RATIO = 0.85   # Volume minimal 85% dari rata-rata 20 candle
 MIN_ADX_TREND    = 20.0   # ADX minimal 20 (mengabaikan market mati/sideway)
@@ -105,8 +106,8 @@ REST_418_COOLDOWN = 900.0
 REST_RETRIES = 2
 
 # Scoring & Risk
-MIN_SCORE                  = 58   # Skor minimal sinyal normal
-SAME_SIDE_EXTRA_SCORE      = 12   # Tambahan skor minimal jika mau entry di arah yang baru saja rugi (58+12 = 70)
+MIN_SCORE                  = 58   
+SAME_SIDE_EXTRA_SCORE      = 12   
 ATR_TP_RESTORED_MULTIPLIER = 3.5
 ATR_SL_RESTORED_MULTIPLIER = 1.8
 
@@ -114,7 +115,7 @@ MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
 MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # Batas maksimal tahan posisi
+MAX_HOLD_SECONDS  = 6120   # Batas maksimal tahan posisi (1.7 Jam)
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -627,7 +628,6 @@ _ticker_ts       = 0
 _lock            = threading.Lock()
 _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
-_hot_syms        = deque(maxlen=30)
 
 _ws_mark_price   = {}
 _kline_cache     = {}
@@ -648,11 +648,15 @@ _stats = {
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
-# Variable Toggle Invert Logika
+# Variable Mode Logika & Lock Direction khusus Mode Inverted
 is_logic_inverted = False 
+_inverted_forced_side = None 
 
-# Variable Tracker Arah Eksekusi yang Terakhir Kali Mengalami Loss (None / "LONG" / "SHORT")
+# Variable Tracker Arah Eksekusi yang Terakhir Kali Mengalami Loss
 _last_failed_execution_side = None
+
+# Tracker Cooldown untuk Rotasi Koin
+symbol_cooldowns = {}
 
 live_positions = {}
 cooldown_list  = {}
@@ -865,14 +869,13 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
-    global is_logic_inverted
+    global is_logic_inverted, _inverted_forced_side
 
     if orig_direction not in ("LONG", "SHORT"):
         return
 
-    # Tentukan Arah Eksekusi Berdasarkan Logika Terbalik
-    if is_logic_inverted:
-        execution_side = "SHORT" if orig_direction == "LONG" else "LONG"
+    if is_logic_inverted and _inverted_forced_side:
+        execution_side = _inverted_forced_side
     else:
         execution_side = orig_direction
 
@@ -896,6 +899,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
 
     open_ts = time.time()
+    entry_mode = "INVERTED" if is_logic_inverted else "NORMAL"
+    
     pos = {
         "side": execution_side,
         "orig_signal": orig_direction,
@@ -914,16 +919,16 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "sl_price": risk["sl_price"],
         "peak_price": price,
         "paper": True,
+        "mode": entry_mode,
     }
 
     with _lock:
         live_positions[sym] = pos
 
     d = "🟢" if execution_side == "LONG" else "🔴"
-    mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
 
     print(
-        f"\n  {d} [PAPER TRADE] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{mode_str}) @{price:.6g} | "
+        f"\n  {d} [PAPER TRADE] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{entry_mode}) @{price:.6g} | "
         f"QTY:{q_val:.8g} | TP:{risk['tp_pct']*100:.2f}% | SL:{risk['sl_pct']*100:.2f}% | In:{pos['open_time_wita']} WITA"
     )
 
@@ -931,7 +936,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if any("Absorb" in s for s in sigs): _stats["absorb_entries"] += 1
 
 def live_close(sym, reason, price=None):
-    global is_logic_inverted, _last_failed_execution_side
+    global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side, symbol_cooldowns
 
     with _lock:
         pos = live_positions.pop(sym, None)
@@ -949,6 +954,7 @@ def live_close(sym, reason, price=None):
     side = pos["side"]
     entry = pos["entry"]
     q_val = pos["qty"]
+    entry_mode = pos.get("mode", "NORMAL")
 
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
@@ -964,21 +970,25 @@ def live_close(sym, reason, price=None):
     close_wita = datetime.fromtimestamp(close_ts, tz=WITA_TZ).strftime("%H:%M:%S")
     open_wita = pos.get("open_time_wita", datetime.fromtimestamp(pos["open_time"], tz=WITA_TZ).strftime("%H:%M:%S"))
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    #  LOGIKA TOGGLE INVERT / NORMAL & SAME-SIDE LOSS TRACKER
-    # ═══════════════════════════════════════════════════════════════════════════
-    if not won:  # Loss (SL atau TIME_LIMIT pnl < 0)
-        is_logic_inverted = not is_logic_inverted  # Toggle mode
-        _last_failed_execution_side = side          # Catat arah eksekusi yang baru saja rugi
-        next_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        print(f"  🔄 [LOGIC TOGGLE] Posisi {side} MINUS ({pnl:+.4f}U)! Mode Berubah ke: {next_mode} | Same-Side Guard Locked for {side}")
+    if not won:
+        _last_failed_execution_side = side
+
+        if not is_logic_inverted:
+            is_logic_inverted = True
+            _inverted_forced_side = "SHORT" if side == "LONG" else "LONG"
+            print(f"  🔄 [MODE CHANGE] Posisi NORMAL {side} LOSS ({pnl:+.4f}U)! Pindah ke INVERTED — KUNCI arah eksekusi ke: {_inverted_forced_side}")
+        else:
+            is_logic_inverted = False
+            _inverted_forced_side = None
+            print(f"  🔄 [MODE CHANGE] Posisi INVERTED {side} LOSS ({pnl:+.4f}U)! Pindah ke NORMAL — Arah Bebas Sesuai Sinyal.")
     else:
-        _last_failed_execution_side = None          # Reset tracker jika profit
+        _last_failed_execution_side = None
         current_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-        print(f"  ✅ [LOGIC STABLE] Posisi {side} PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}")
+        forced_str = f" (Locked:{_inverted_forced_side})" if _inverted_forced_side else ""
+        print(f"  ✅ [LOGIC STABLE] Posisi {side} PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}{forced_str}")
 
     print(
-        f"  {e_icon} [PAPER EXIT] {sym} {side} CLOSE — {reason} | "
+        f"  {e_icon} [PAPER EXIT] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
         f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U | Out:{close_wita} WITA"
     )
 
@@ -1016,9 +1026,11 @@ def live_close(sym, reason, price=None):
         "reason": reason, "hold": int(hold),
         "in_wita": open_wita,
         "out_wita": close_wita,
+        "mode": entry_mode,
     })
 
-    _hot_syms.appendleft(sym)
+    # ENHANCEMENT: Berikan cooldown pada koin yang baru di-exit agar koin lain terbebas dari monopoli
+    symbol_cooldowns[sym] = time.time() + COOLDOWN_PER_SYMBOL
     _rescan_q.put(1)
     print_inline()
 
@@ -1040,14 +1052,13 @@ def monitor_positions():
             if px <= tp_px: live_close(sym, "TP", tp_px); continue
             if px >= sl_px: live_close(sym, "SL", sl_px); continue
 
-        # Time Limit Check
         if hold_time > MAX_HOLD_SECONDS:
             print(f"  ⏰ {sym}: MAX_HOLD_SECONDS terlampaui ({hold_time:.0f}s) — TIME_LIMIT close")
             live_close(sym, "TIME_LIMIT", px)
             continue
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCANNER THREAD & STRICT FILTERS (WITH SAME-SIDE RETRY GUARD)
+#  SCANNER THREAD & STRICT FILTERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scan_one(sym):
@@ -1068,37 +1079,36 @@ def scan_one(sym):
         # ── FILTER 1: Strict Volume & Sideway Guard ─────────────────────────
         if vr_val < MIN_VOLUME_RATIO:
             _stats["low_vol_veto"] += 1
-            return None  # Volume terlalu tipis
+            return None
         if adx_val < MIN_ADX_TREND:
             _stats["low_vol_veto"] += 1
-            return None  # Market sideway tanpa tren
+            return None
         if (atr_val / px_candle) < MIN_ATR_PCT:
             _stats["low_vol_veto"] += 1
-            return None  # Volatilitas terlalu rendah
+            return None
 
         orig_direction, score, sigs, _, regime, bias = scorer.get_signal(df_ta, sym)
         if orig_direction is None or orig_direction not in ("LONG", "SHORT"):
             return None
 
-        # Evaluasi Arah Eksekusi Aktual Berdasarkan Mode Active
-        execution_side = ("SHORT" if orig_direction == "LONG" else "LONG") if is_logic_inverted else orig_direction
+        if is_logic_inverted and _inverted_forced_side:
+            opposite_needed = "LONG" if _inverted_forced_side == "SHORT" else "SHORT"
+            if orig_direction != opposite_needed:
+                return None 
+            execution_side = _inverted_forced_side
+        else:
+            execution_side = orig_direction
 
         # ── FILTER 2: DIRECTIONAL SAME-SIDE LOSS GUARD ─────────────────────
-        # Jika eksekusi baru ini mempunya arah SAMA dengan posisi terakhir yang rugi,
-        # aktifkan Filter Tambahan Ketat agar tidak rugi berturut-turut pada arah yang sama.
         if _last_failed_execution_side is not None and execution_side == _last_failed_execution_side:
-            required_score = MIN_SCORE + SAME_SIDE_EXTRA_SCORE # Butuh skor minimal 70
+            required_score = MIN_SCORE + SAME_SIDE_EXTRA_SCORE
             
-            # Pengecekan konfirmasi tambahan:
-            # 1. Skor Sinyal harus sangat tinggi (>= 70)
-            # 2. ADX harus > 25 (Tren sangat jelas)
-            # 3. Momentum candle 5m (m5) harus searah dengan eksekusi
             m5_val = last_row.get("m5", 0.0)
             trend_aligned = (execution_side == "LONG" and m5_val > 0.001) or (execution_side == "SHORT" and m5_val < -0.001)
 
             if score < required_score or adx_val < 25.0 or not trend_aligned:
                 _stats["same_side_veto"] += 1
-                return None  # VETO: Gagal meloloskan filter tambahan untuk retry arah yang sama
+                return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1150,33 +1160,35 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
+    forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
-    print(f"       ┌ [PAPER ENGINE v22 - MODE: {mode_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
-    print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
+    print(f"        ┌ [PAPER ENGINE v22.2 ENHANCED - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    print(f"        └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
+    forced_str = f" [{_inverted_forced_side} ONLY]" if _inverted_forced_side else ""
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
     failed_str = f" [SAME-SIDE GUARD ACTIVE: {_last_failed_execution_side}]" if _last_failed_execution_side else ""
     
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD (MODE LOGIKA: {mode_str}){failed_str} [{now_wita}]")
+    print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD (MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
     print(f"    📈 Exit: TP:{_stats['tp_exit']} | SL:{_stats['hard_sl']} | TimeLimit:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
-    # RIWAYAT 5 KOIN/TOKEN TERAKHIR DENGAN JAM ENTER/EXIT ZONA MAKASSAR (WITA)
     if trade_log:
-        print(f"    {'─'*68}\n    📋 Last 5 (Makassar / WITA Timezone):")
+        print(f"    {'─'*68}\n    📋 Last 5 Trades (Makassar / WITA Timezone):")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] >= 0 else "🔴"
             in_t = t.get("in_wita", "--:--:--")
             out_t = t.get("out_wita", "--:--:--")
-            print(f"        {em} {t['sym']:<14} {t['side']:<5} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
+            mode_lbl = f"[{t.get('mode', 'NORMAL')}]"
+            print(f"        {em} {t['sym']:<12} {t['side']:<5} {mode_lbl:<10} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']:<11} | In:{in_t} Out:{out_t}")
     print(f"  {'─'*72}")
 
 def t_monitor():
@@ -1197,14 +1209,21 @@ def t_slot_filler(syms):
 
             now = time.time()
             with _lock:
-                valid_syms = [s for s in syms if s not in live_positions]
+                # ENHANCEMENT: Saring koin yang sedang dalam Cooldown atau sedang ada Posisi Aktif
+                valid_syms = [
+                    s for s in syms 
+                    if s not in live_positions and now >= symbol_cooldowns.get(s, 0.0)
+                ]
 
-            hot = [s for s in _hot_syms if s in valid_syms]
-            mv = top_movers(valid_syms, 30)
-            bs = scan_idx * BATCH_SIZE
-            reg = [s for s in valid_syms[bs:bs+BATCH_SIZE] if s not in mv]
-            scan_idx = (scan_idx + 1) % n_bat
-            scan_list = list(dict.fromkeys(hot[:5] + mv[:20] + reg[:15]))[:BATCH_SIZE]
+            if not valid_syms:
+                time.sleep(SLOT_FILL_INT); continue
+
+            # ENHANCEMENT: Ambil top movers dan acak rotasi koin regular agar pemindaian lebih berimbang
+            mv = top_movers(valid_syms, 20)
+            rest_syms = [s for s in valid_syms if s not in mv]
+            random.shuffle(rest_syms)
+
+            scan_list = list(dict.fromkeys(mv[:10] + rest_syms[:10]))[:BATCH_SIZE]
 
             if not scan_list:
                 time.sleep(SLOT_FILL_INT); continue
@@ -1228,10 +1247,14 @@ def t_rescan(syms):
             slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0]: continue
 
-            valid_syms = [s for s in syms if s not in live_positions]
-            hot = [s for s in _hot_syms if s in valid_syms]
-            rest = [s for s in valid_syms if s not in hot]
-            res = scan_batch((hot + rest)[:30])
+            now = time.time()
+            valid_syms = [
+                s for s in syms 
+                if s not in live_positions and now >= symbol_cooldowns.get(s, 0.0)
+            ]
+            
+            random.shuffle(valid_syms)
+            res = scan_batch(valid_syms[:30])
             if res:
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
@@ -1316,13 +1339,11 @@ def handle_depth_multiplex(msg):
 
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v22.0 LIVE — DIRECTIONAL ANTI-REPEAT PROTECTION   ║")
-    print("║  1. Mode Awal: NORMAL (LONG->LONG, SHORT->SHORT)                   ║")
-    print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
-    print("║  3. Jika Loss (SL/TimeLimit < 0) -> TOGGLE Invert/Normal           ║")
-    print("║  4. Directional Loss Guard: Jika mau Retry di arah eksekusi yang   ║")
-    print("║     sama saat baru loss, Wajib Skor >= 70, ADX > 25 & Trend Strong.║")
-    print("║  5. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
+    print("║  💎 BOT SCALPING v22.2 PAPER — ROTATION ENHANCED QUANT ENGINE     ║")
+    print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
+    print("║  2. Rotation Guard: Cooldown 10 Menit Koin Pasca Exit (Anti Monopoly)║")
+    print("║  3. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
+    print("║  4. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
     
     try:
@@ -1358,14 +1379,15 @@ def run_bot():
         cycle += 1
         slots = MAX_POSITIONS - len(live_positions)
         mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
+        forced_str = f" [{_inverted_forced_side} ONLY]" if _inverted_forced_side else ""
         now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S")
         guard_status = f" | Guard:[{_last_failed_execution_side}]" if _last_failed_execution_side else ""
         print(f"\n{'═'*68}")
-        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+        print(f"  #{cycle} {now_wita} WITA | BTC_5M:{_macro['btc']} Mode:[{mode_str}{forced_str}]{guard_status} ActivePos:({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
-        else: print(f"  🔍 Slot Kosong — Scanning Signal (Mode: {mode_str})...")
+        else: print(f"  🔍 Slot Kosong — Scanning Signal (Mode: {mode_str}{forced_str})...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
